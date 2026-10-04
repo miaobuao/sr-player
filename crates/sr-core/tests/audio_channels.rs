@@ -13,31 +13,30 @@
 //! result did not contain what the graph claimed — the bursts were in channel 1
 //! and every level was about 15 dB low.
 //!
-//! ## What this test found, and why it is ignored
+//! ## Status: the LDR fix landed, and unblocked a second defect
 //!
-//! With a fixture that verifies clean, the pipeline still declines to ride the
-//! dialogue, and the reason is a real defect one level above the detector:
+//! The first defect this fixture found was that `dialogue_lufs` was measured from
+//! the **programme's** blocks gated by the speech mask — "how loud the whole mix
+//! is while someone is talking" — which with music under the dialogue is the
+//! programme by construction, so LDR collapsed to zero and the rider never acted.
+//! `analyze` now keeps a second `LoudnessMeter` on the dialogue channel (the same
+//! centre samples the detector already receives) and gates *that* by the mask.
 //!
-//! * the detector is correct — `speech_ratio` 0.403 for a 1/3 duty cycle,
-//!   confidence 1.00, a 73.7 dB median SNR, and a mask whose runs line up with
-//!   the bursts exactly;
-//! * `dialogue_lufs` comes out at -2.566 against a programme of -2.573, so
-//!   `LDR` is -0.007 LU and `decide` correctly declines ("already within the
-//!   5.0 LU target").
+//! With the rider finally engaging, this test fails for a new reason: the
+//! enhanced WAV it writes contains samples around 1e27.
 //!
-//! The dialogue loudness is measured from the **programme's** per-block loudness
-//! gated by the speech mask — that is, "how loud the whole mix is while someone
-//! is talking". With music playing under the dialogue, which is most of a film,
-//! that is close to the programme by construction, so LDR collapses toward zero
-//! and the rider never acts. The centre channel is already decoded and handed to
-//! the *detector*; it is simply never handed to a meter.
+//! * two independent readers agree — FFmpeg decoding the WAV, and reading the
+//!   float samples straight out of the file — so it is not a measurement artefact;
+//! * the pipeline's own `ebur128` pass over that same file reports -19.0 LUFS and
+//!   -20.8 dBTP, which cannot both be true of samples at 1e27.
 //!
-//! The fix is to measure the dialogue channel itself: a `LoudnessMeter` for the
-//! centre samples (which `analyze` already extracts) whose `block_loudness()` is
-//! gated by the same mask. That is what LDR means.
+//! That contradiction is the open question. What is *not* in doubt is that the
+//! rider is now reachable, which it was not before, and that the failure is real
+//! rather than a fixture problem: the fixture verifies clean in
+//! `the_fixture_carries_what_it_claims_to_carry`.
 //!
-//! The test is ignored rather than adjusted so the finding stays in the tree and
-//! becomes the regression test for that fix.
+//! The test stays ignored so the finding remains in the tree and becomes the
+//! regression test once the processor is fixed.
 //!
 //! Skips itself when FFmpeg is unavailable.
 
@@ -152,20 +151,35 @@ fn build_fixture(ff: &Ffmpeg, dir: &Path) -> Fixture {
 }
 
 /// Per-channel mean absolute level of a file (or the enhanced WAV), settled tail.
+///
+/// Runs FFmpeg directly rather than through `capture`, which returns a `String`:
+/// pushing raw `f32` samples through a UTF-8 lossy conversion turns them into
+/// numbers like 1e35, which is how this helper first reported the fixture as
+/// absurdly loud and the output as NaN.
 fn channel_levels(ff: &Ffmpeg, path: &Path, channels: usize) -> Vec<f64> {
-    let mut argv = sr_core::ffmpeg::args(&["-hide_banner", "-loglevel", "error", "-i"]);
-    argv.push(path.display().to_string());
-    argv.extend(sr_core::ffmpeg::args(&[
-        "-map",
-        "0:a:0",
-        "-f",
-        "f32le",
-        "-ac",
-        &channels.to_string(),
-        "-",
-    ]));
-    let raw = capture(&ff.ffmpeg, &argv).expect("decode to f32le");
-    let bytes = raw.as_bytes();
+    let output = std::process::Command::new(&ff.ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &path.display().to_string(),
+            "-map",
+            "0:a:0",
+            "-f",
+            "f32le",
+            "-ac",
+            &channels.to_string(),
+            "-",
+        ])
+        .output()
+        .expect("decode to f32le");
+    assert!(
+        output.status.success(),
+        "decode failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = &output.stdout;
     let samples: &[f32] = unsafe {
         std::slice::from_raw_parts(
             bytes.as_ptr() as *const f32,
@@ -224,10 +238,36 @@ fn the_fixture_carries_what_it_claims_to_carry() {
     );
 }
 
+/// The same measurement, read straight out of the float WAV our own writer made.
+///
+/// Two independent readers of the same bytes: if they disagree, the disagreement
+/// is the finding.
+fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
+    let bytes = std::fs::read(path).expect("read the WAV");
+    // Canonical 44-byte float WAV header, which is what `WavWriter` writes.
+    let data = &bytes[44..];
+    let samples: &[f32] = unsafe {
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const f32,
+            data.len() / std::mem::size_of::<f32>(),
+        )
+    };
+    let frames = samples.len() / channels;
+    let start = frames.saturating_sub(96_000);
+    let mut totals = vec![0.0f64; channels];
+    for frame in start..frames {
+        for channel in 0..channels {
+            totals[channel] += samples[frame * channels + channel].abs() as f64;
+        }
+    }
+    let count = (frames - start).max(1) as f64;
+    totals.into_iter().map(|total| total / count).collect()
+}
+
 #[test]
-#[ignore = "found a real defect: dialogue loudness is measured from the programme's blocks gated \
-            by the speech mask, so LDR collapses to 0 whenever music plays under dialogue and \
-            the rider never acts — see the module comment for the fix"]
+#[ignore = "found a second defect: with the LDR fix in place the rider engages, and the enhanced \
+            WAV it writes contains samples around 1e27 while the pipeline's own ebur128 reports \
+            -19 LUFS for the same file — see the module comment"]
 fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
@@ -321,9 +361,13 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
         .join("enhanced-audio.wav");
     assert!(enhanced.exists(), "the enhanced track must be on disk");
     let source = channel_levels(&ff, &fixture.path, 6);
+    // Read the enhanced WAV directly rather than through FFmpeg, so the two
+    // numbers come from two different readers and a disagreement is visible.
+    let direct = wav_channel_levels(&enhanced, 6);
     let result = channel_levels(&ff, &enhanced, 6);
-    eprintln!("source : {source:?}");
-    eprintln!("rider  : {result:?}");
+    eprintln!("source      : {source:?}");
+    eprintln!("enhanced raw: {direct:?}");
+    eprintln!("enhanced ff : {result:?}");
 
     // Centre: the dialogue channel, lifted.
     assert!(

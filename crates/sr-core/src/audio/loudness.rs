@@ -263,6 +263,16 @@ pub fn analyze(
     let mut reader = PcmReader::open(ff, manifest.path.as_path(), &decode, reporter, cancel)?;
     reader.channels = channels;
     let mut meter = LoudnessMeter::new(opts.sample_rate, channels, layout.as_deref());
+    // A second meter on the dialogue channel alone.
+    //
+    // `LDR = programme - dialogue` is only meaningful if the two numbers are
+    // measured on different things. Measuring the dialogue from the *programme's*
+    // blocks, gated by the speech mask, answers "how loud is the whole mix while
+    // someone is talking" — which, with music under the dialogue, is the
+    // programme by construction, so LDR collapses toward zero and the rider never
+    // acts. The centre samples are already extracted for the detector; they are
+    // what the dialogue meter needs.
+    let mut dialogue_meter = LoudnessMeter::new(opts.sample_rate, 1, None);
     let mut detector = SpeechDetector::new(opts.sample_rate, opts.dialogue.clone());
 
     let block_frames = (opts.sample_rate as usize / 10).max(1) * 10; // 100 ms
@@ -297,6 +307,7 @@ pub fn analyze(
             );
         }
         detector.push(&mono_scratch);
+        dialogue_meter.push(&mono_scratch);
 
         if last_report.elapsed() >= Duration::from_millis(400) {
             last_report = std::time::Instant::now();
@@ -317,13 +328,16 @@ pub fn analyze(
         }
     }
     meter.flush();
+    dialogue_meter.flush();
     detector.flush();
     reader.finish()?;
 
     let programme_lufs = meter.integrated_lufs();
     let block_loudness = meter.block_loudness();
     let track = detector.finish(programme_lufs, &block_loudness);
-    let dialogue_lufs = dialogue_loudness(&block_loudness, &track.mask);
+    // The dialogue channel's own loudness, gated by the speech mask: the second
+    // half of the ratio, measured on the signal the mask was derived from.
+    let dialogue_lufs = dialogue_loudness(&dialogue_meter.block_loudness(), &track.mask);
     let ldr = ldr_lu(programme_lufs, dialogue_lufs);
     let decision = decide(
         programme_lufs,
