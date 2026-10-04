@@ -67,23 +67,20 @@ sr_rife* sr_rife_create(sr_context* ctx, const char* model_dir)
 
     rife->net.opt.use_vulkan_compute = true;
 
-    // Pin the blob layout to plain fp32, elempack 1.
+    // Exactly the option set the reference implementation uses (RIFE::load):
     //
-    // The vendored Warp layer indexes a blob as if `elempack` were 1 on the Mat
-    // path and handles 1 and 4 on the Vulkan path; it does not handle 8 at all.
-    // ncnn is otherwise free to choose a packed or fp16-storage layout, and when
-    // it does, the layer is handed a blob it cannot index and the warp silently
-    // produces noise while every value stays in range. Left to its defaults this
-    // network produced exactly that: a frame with the right mean and range made
-    // of high-frequency garbage.
-    rife->net.opt.use_packing_layout = false;
-    rife->net.opt.use_fp16_packed = false;
-    rife->net.opt.use_fp16_storage = false;
+    //     opt.use_fp16_packed   = vkdev ? true : false;
+    //     opt.use_fp16_storage  = vkdev ? true : false;
+    //     opt.use_fp16_arithmetic = false;
+    //     opt.use_int8_storage  = false;
+    //
+    // Earlier attempts pinned packing and fp16 storage OFF, which is not what the
+    // models were validated with, and they were only ever measured at a frame size
+    // now known to suppress the network. This is the reference configuration.
+    rife->net.opt.use_fp16_packed = true;
+    rife->net.opt.use_fp16_storage = true;
     rife->net.opt.use_fp16_arithmetic = false;
-    // RIFE is a chain of small convolutions; one CPU thread is right, because
-    // the work happens on the device and ncnn's CPU threads would only contend
-    // with the staging copies.
-    rife->net.opt.num_threads = 1;
+    rife->net.opt.use_int8_storage = false;
     rife->net.set_vulkan_device(ctx->device_index);
 
     if (rife->net.register_custom_layer("rife.Warp", Warp_layer_creator) != 0)
