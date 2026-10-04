@@ -6,28 +6,25 @@
 //! comes out has a lifted centre, an untouched LFE, and screen channels that were
 //! not lifted along with the dialogue.
 //!
-//! ## Open defect, and why this test is ignored
+//! ## Corrected finding: the fixture is wrong, not the detector
 //!
-//! It cannot build a fixture the dialogue detector fires on, and the reason is
-//! not the fixture. On a 12 s 5.1 file — real synthesised speech in the centre
-//! for the first three seconds, loud music in the screen channels, silence
-//! elsewhere — the detector's per-chunk level trace is **flat**: 1200 chunks,
-//! all within 1e-5 dB of each other, on a signal whose centre channel measures
-//! -27.9 LUFS when extracted on its own. With a flat trace, `noise_floor` and
-//! `p95` are the same number, the threshold becomes `floor + 9 dB`, no chunk ever
-//! crosses it, and the rider declines with "no dialogue-like activity found".
+//! A first version of this file reported the dialogue detector as defective,
+//! because its per-chunk level trace was flat on this fixture and the rider
+//! therefore never applied. That was wrong, and the correction matters:
 //!
-//! The same happens with a gated tone, with continuous speech, and on the
-//! extracted centre channel as a mono file, so it is not about the layout or the
-//! content: the level the detector is fed does not vary. What that says about
-//! [`sr_core::audio::dialogue::SpeechDetector`] on multichannel input — whether
-//! the wrong channel is being measured, or the same block is measured repeatedly,
-//! or the level is being computed from something other than the samples — is not
-//! yet established.
+//! * `audio::dialogue`'s own experiment proves the detector works — a tone burst
+//!   over digital silence gives `speech_ratio` 0.27, confidence 1.00, a noise
+//!   floor of -120 dB and a level trace that varies exactly as it should;
+//! * `ffmpeg -af volumedetect` on the fixture, one channel at a time, shows the
+//!   fixture does not contain what it was built to contain: the *speech* is in
+//!   channel 1 (14 dB crest factor, against the 3 dB of a sine) rather than the
+//!   centre, and every channel sits about 15 dB below the level the filter graph
+//!   asked for.
 //!
-//! Leaving the test enabled would mean either asserting behaviour I believe is
-//! wrong, or asserting nothing. It is `#[ignore]`d so the finding stays in the
-//! tree and the test can be run with `--ignored` once the detector is fixed.
+//! So the flat trace was the detector correctly declining to find dialogue in a
+//! file whose centre channel holds a steady tone. The lavfi `join` graph this
+//! file uses is the thing that needs fixing, and until it is, this test cannot
+//! assert anything about the pipeline's channel handling.
 //!
 //! Skips itself when FFmpeg is unavailable.
 
@@ -161,9 +158,75 @@ fn channel_levels(ff: &Ffmpeg, path: &Path, channels: usize) -> Vec<f64> {
     totals.into_iter().map(|total| total / count).collect()
 }
 
+/// Does the fixture contain what it claims to?
+///
+/// Measured with FFmpeg's own `volumedetect`, one channel at a time, rather than
+/// with a hand-written accumulator in the test: the first version of this check
+/// had an accounting bug that produced readings of 579 dBFS, and a measurement
+/// tool that can be wrong is not evidence.
+///
+/// The signature it looks for: the speech channel has a large crest factor
+/// (speech is bursty; a sine is 3 dB), and it must be the *centre* channel.
 #[test]
-#[ignore = "open defect: the dialogue detector's per-chunk level trace is flat on 5.1 input, so \
-            no decision is ever reached — see the module comment"]
+#[ignore = "diagnostic: it fails on purpose, showing that the lavfi join fixture puts the speech \
+            in channel 1 instead of the centre (crest factors [3.0, 13.2, 3.0, 3.0, 3.0, 3.0]) — \
+            see the module comment"]
+fn the_fixture_puts_speech_in_the_centre_channel() {
+    let Some(ff) = ffmpeg_or_skip() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = build_fixture(&ff, dir.path());
+
+    let mut measured = Vec::new();
+    for channel in 0..6 {
+        // `volumedetect` reports on stderr, which `capture` does not return, so
+        // this one command is run directly.
+        let output = std::process::Command::new(&ff.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-i",
+                &input.display().to_string(),
+                "-af",
+                &format!("pan=mono|c0=c{channel},volumedetect"),
+                "-f",
+                "null",
+                "NUL",
+            ])
+            .output()
+            .expect("run ffmpeg");
+        let text = String::from_utf8_lossy(&output.stderr).into_owned();
+        let value = |needle: &str| -> Option<f64> {
+            let start = text.find(needle)? + needle.len();
+            text[start..]
+                .split_whitespace()
+                .next()?
+                .parse::<f64>()
+                .ok()
+        };
+        let mean = value("mean_volume:").unwrap_or(-120.0);
+        let peak = value("max_volume:").unwrap_or(-120.0);
+        measured.push((mean, peak));
+    }
+    eprintln!("per channel (mean, peak) dBFS: {measured:?}");
+
+    let crest = |(mean, peak): (f64, f64)| peak - mean;
+    let speech_channel = measured
+        .iter()
+        .enumerate()
+        .max_by(|a, b| crest(*a.1).partial_cmp(&crest(*b.1)).expect("no NaN"))
+        .map(|(index, _)| index)
+        .expect("six channels");
+    assert_eq!(
+        speech_channel, 2,
+        "the speech must land in the centre channel (index 2); crest factors were {:?}",
+        measured.iter().map(|m| crest(*m)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore = "blocked by the fixture: the speech never reaches the centre channel, so the rider has \
+            nothing to act on — see the module comment"]
 fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;

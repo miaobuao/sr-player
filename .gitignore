@@ -20,3 +20,6 @@
 # system font that must not be redistributed.
 /testdata/*
 !/testdata/make_fixture.ps1
+
+# Scratch directories used while investigating (never part of the tree).
+/.sr-*/

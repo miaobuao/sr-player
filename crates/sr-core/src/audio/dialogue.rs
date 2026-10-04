@@ -393,6 +393,31 @@ mod tests {
     }
 
     #[test]
+    fn experiment_burst_over_digital_silence() {
+        let rate = 48_000;
+        let mut mono = tone(1000.0, rate, 0.25, 3.0);
+        mono.extend(std::iter::repeat(0.0f32).take(rate as usize * 9));
+        let mut detector = SpeechDetector::new(rate, SpeechDetectorOptions::default());
+        detector.push(&mono);
+        detector.flush();
+        let track = detector.finish(-20.0, &vec![0.0; 1200]);
+        eprintln!(
+            "burst: chunks={} floor={:.2} threshold={:.2} p95? ratio={:.3} conf={:.2}\n\
+             first 6 levels: {:?}\n\
+             levels 300..306: {:?}\n\
+             levels 600..606: {:?}",
+            track.levels_db.len(),
+            track.noise_floor_db,
+            track.threshold_db,
+            track.speech_ratio,
+            track.confidence,
+            &track.levels_db[0..6],
+            &track.levels_db[300..306],
+            &track.levels_db[600..606]
+        );
+    }
+
+    #[test]
     fn detector_finds_gated_speech_bursts() {
         let rate = 48_000;
         let mono = speech_bursts(rate, 12.0);
