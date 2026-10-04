@@ -125,6 +125,14 @@ pub struct VideoPlan {
     /// Present exactly when `executor` is [`VideoExecutor::NativeInference`].
     pub inference: Option<InferencePlan>,
     pub regrain_strength: f32,
+    /// Per-shot re-grain strength, indexed by shot.
+    ///
+    /// Empty when re-grain is off. Filled from a measurement of the source, because
+    /// a film's grain varies from shot to shot by more than any single setting can
+    /// cover — and only the per-chunk executor can apply it, since FFmpeg's `noise`
+    /// filter takes one constant for a whole chain. `regrain_strength` stays as the
+    /// fallback for the single-pass path and for shots with no measurement.
+    pub regrain_per_shot: Vec<f32>,
     /// Filters FFmpeg applies on the encode side. For the native executor this is
     /// the post-model chain only; the model is not an FFmpeg filter.
     pub filter_chain: String,
@@ -917,6 +925,48 @@ pub fn build_plan(
         }
     });
 
+    // ---- grain ------------------------------------------------------------
+    //
+    // Measured only when re-grain was asked for: it costs a decode pass at native
+    // resolution, and a job that is not re-graining should not pay for it. The
+    // measurement is what makes per-shot re-grain more than a name — the strength
+    // comes from the film rather than from a setting.
+    let mut regrain_per_shot: Vec<f32> = Vec::new();
+    if profile.output.regrain_strength > 0.0 {
+        // A local reporter and flag, because `build_plan` has neither: it is called
+        // with a manifest and two analyses, not with the job's channels. The cost is
+        // that this pass cannot be cancelled from outside and does not log its
+        // measurement - it is bounded to `max_frames` frames, and the amplitudes end
+        // up in the plan, which the caller stores. Threading the job's channels into
+        // the planner would be the cleaner shape and is a larger change than this
+        // pass is worth making here.
+        let bus = crate::EventBus::new();
+        let reporter = crate::Reporter::new(bus);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match crate::pipeline::grain::measure_shots(
+            ff,
+            manifest,
+            &scenes.shots,
+            cadence.chain_str().as_deref(),
+            &crate::pipeline::grain::GrainOptions::default(),
+            &reporter,
+            &cancel,
+        ) {
+            Ok(measured) => {
+                // Silent here: `build_plan` has no reporter, and the values are in the
+                // plan the caller stores and logs. A pass that cannot report is not a
+                // reason to give it a channel it has never needed.
+                regrain_per_shot = measured
+                    .iter()
+                    .map(|shot| crate::pipeline::grain::strength_for(&shot.estimate))
+                    .collect();
+            }
+            Err(_) => {
+                // A measurement that fails must not fail the job. The fallback is the
+                // configured strength, which is exactly what ran before this existed.
+            }
+        }
+    }
     let mut video = VideoPlan {
         source: VideoSourceInfo {
             width: raw_w as u32,
@@ -945,6 +995,7 @@ pub fn build_plan(
         executor,
         inference,
         regrain_strength: profile.output.regrain_strength,
+        regrain_per_shot,
         filter_chain: String::new(),
         decode_chain: String::new(),
         encoder,
@@ -1239,6 +1290,7 @@ mod tests {
             executor: VideoExecutor::FfmpegSinglePass,
             inference: None,
             regrain_strength: 0.0,
+            regrain_per_shot: Vec::new(),
             filter_chain: String::new(),
             decode_chain: String::new(),
             encoder: SelectedVideoEncoder {

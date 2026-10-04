@@ -360,7 +360,7 @@ impl<'a> NativeExecutor<'a> {
                 continue;
             }
 
-            let mut encoder = ChunkEncoder::start(self.ff, ctx, video, &path, model_size)?;
+            let mut encoder = ChunkEncoder::start(self.ff, ctx, video, &path, model_size, chunk.shot)?;
             let mut frames_written = 0u64;
             for segment in &run_plan.segments[chunk.first_segment..=chunk.last_segment] {
                 self.check_cancel()?;
@@ -986,8 +986,9 @@ impl ChunkEncoder {
         video: &VideoPlan,
         path: &Path,
         model_size: (u32, u32),
+        shot: usize,
     ) -> Result<Self> {
-        let argv = build_chunk_args(ctx, video, path, model_size);
+        let argv = build_chunk_args(ctx, video, path, model_size, shot);
         let spec = RunSpec::new(Stage::Encode, "chunk-encode");
         let mut child = StreamingChild::spawn(&ff.ffmpeg, &argv, ctx.reporter, &spec, true)?;
         let stdin = child.stdin.take().ok_or_else(|| Error::Stage {
@@ -1061,6 +1062,7 @@ fn build_chunk_args(
     video: &VideoPlan,
     path: &Path,
     model_size: (u32, u32),
+    shot: usize,
 ) -> Vec<String> {
     let mut argv = args(&["-hide_banner", "-nostdin", "-y"]);
     let size = format!("{}x{}", model_size.0, model_size.1);
@@ -1077,8 +1079,27 @@ fn build_chunk_args(
         "-i",
         "-",
     ]));
-    if !video.filter_chain.is_empty() {
-        argv.extend(args(&["-vf", &video.filter_chain]));
+    // Grain belongs to the shot, and this is the only place in the pipeline where a
+    // filter can vary from one part of the film to the next: the single-pass chain
+    // takes one strength for everything, because FFmpeg's `noise` filter takes a
+    // constant.
+    let mut filters = video.filter_chain.clone();
+    if let Some(strength) = video
+        .regrain_per_shot
+        .get(shot)
+        .copied()
+        .filter(|strength| *strength > 0.0)
+    {
+        if !filters.is_empty() {
+            filters.push(',');
+        }
+        filters.push_str(&format!(
+            "noise=alls={:.1}:allf=t+u",
+            strength.clamp(1.0, 30.0)
+        ));
+    }
+    if !filters.is_empty() {
+        argv.extend(args(&["-vf", &filters]));
     }
     match ctx.chunk_encoding {
         ChunkEncoding::LosslessIntermediate => {

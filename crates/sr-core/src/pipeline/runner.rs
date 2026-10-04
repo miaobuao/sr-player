@@ -1411,6 +1411,7 @@ mod tests {
             executor: crate::pipeline::plan::VideoExecutor::FfmpegSinglePass,
             inference: None,
             regrain_strength: 0.0,
+            regrain_per_shot: Vec::new(),
             filter_chain: "scale=1440:960:flags=lanczos,framerate=fps=47.952048".into(),
             decode_chain: String::new(),
             encoder: SelectedVideoEncoder {

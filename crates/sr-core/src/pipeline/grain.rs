@@ -361,6 +361,21 @@ pub fn measure_shots(
         .collect())
 }
 
+/// The FFmpeg `noise` strength that reproduces a measured amplitude.
+///
+/// The constant is calibrated from measurement rather than derived: `alls=6` on a
+/// flat picture produced an estimated deviation of 0.0078 (2.0 code values at 8
+/// bits) and `alls=24` produced 0.0364 (9.3 values), so the filter's strength runs
+/// at roughly 2.6 times the deviation it produces. It is a scale factor between two
+/// different things — an amplitude and a filter parameter — and the honest way to
+/// record it is with the two points it came from.
+pub fn strength_for(estimate: &GrainEstimate) -> f32 {
+    if !estimate.is_worth_applying() {
+        return 0.0;
+    }
+    (estimate.sigma * 255.0 * 2.6).clamp(1.0, 30.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +504,45 @@ mod tests {
             "the median must ignore the intruder: {}",
             shot.describe()
         );
+    }
+
+    /// The strength a shot's measurement turns into must differ between shots whose
+    /// grain differs, and must be zero for a shot with none.
+    ///
+    /// This is the whole point of measuring: a per-shot table that came out with one
+    /// value repeated would be a global setting with more steps.
+    #[test]
+    fn the_strength_follows_the_measurement() {
+        let quiet = GrainEstimate {
+            sigma: 0.0078,
+            samples: 50_000,
+            confidence: 1.0,
+        };
+        let heavy = GrainEstimate {
+            sigma: 0.0364,
+            samples: 50_000,
+            confidence: 1.0,
+        };
+        let clean = GrainEstimate {
+            sigma: 0.0001,
+            samples: 50_000,
+            confidence: 1.0,
+        };
+        let (a, b, c) = (
+            strength_for(&quiet),
+            strength_for(&heavy),
+            strength_for(&clean),
+        );
+        eprintln!("quiet {a:.1}, heavy {b:.1}, clean {c:.1}");
+        // The two points the calibration came from: alls=6 measured 0.0078 and
+        // alls=24 measured 0.0364. The mapping has to return roughly those.
+        assert!((a - 6.0).abs() < 2.0, "0.0078 should map near 6, got {a:.1}");
+        assert!((b - 24.0).abs() < 4.0, "0.0364 should map near 24, got {b:.1}");
+        assert!(
+            b > a * 3.0,
+            "the two shots must not come out with nearly the same strength"
+        );
+        assert_eq!(c, 0.0, "a clean shot must not be grained at all");
     }
 
     #[test]
