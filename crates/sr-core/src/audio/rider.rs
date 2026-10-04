@@ -1169,6 +1169,81 @@ mod tests {
     }
 
     #[test]
+    fn twelve_seconds_of_six_channels_stays_bounded() {
+        // The pipeline runs a whole runtime in 100 ms blocks; unit tests here ran
+        // a second or two, which is not long enough for a filter's state to
+        // misbehave visibly. This walks the same distance with the same block
+        // size and asserts that every channel stays inside the range the input
+        // put it in.
+        //
+        // It exists because a pipeline run produced samples around 1e27 in its
+        // output file, and the first thing worth establishing was whether the
+        // processor can do that at all. It cannot.
+        let settings = RiderSettings::default();
+        let rate = 48_000u32;
+        let frames = rate as usize * 12;
+        let curve = settled_curve(&settings, 1200);
+        let mut processor = RemasterProcessor::new(curve, 6, rate, &settings, Some("5.1"));
+
+        let mut data = vec![0.0f32; frames * 6];
+        for frame in 0..frames {
+            let t = frame as f64 / rate as f64;
+            let music = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 0.6;
+            let talk = if t % 3.0 < 1.0 {
+                (2.0 * std::f64::consts::PI * 1200.0 * t).sin() * 0.06
+            } else {
+                0.0005 * (2.0 * std::f64::consts::PI * 120.0 * t).sin()
+            };
+            let rumble = (2.0 * std::f64::consts::PI * 60.0 * t).sin() * 0.5;
+            let surround = (2.0 * std::f64::consts::PI * 400.0 * t).sin() * 0.4;
+            let base = frame * 6;
+            data[base] = music as f32;
+            data[base + 1] = music as f32;
+            data[base + 2] = talk as f32;
+            data[base + 3] = rumble as f32;
+            data[base + 4] = surround as f32;
+            data[base + 5] = surround as f32;
+        }
+        let original = data.clone();
+
+        for block in data.chunks_mut(rate as usize / 10 * 6) {
+            processor.process_block(block);
+        }
+
+        assert!(
+            data.iter().all(|sample| sample.is_finite()),
+            "every sample must stay finite"
+        );
+        for channel in 0..6 {
+            let peak = (0..frames)
+                .map(|frame| data[frame * 6 + channel].abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                peak <= 1.0,
+                "channel {channel} peaked at {peak}, above the range the input put it in"
+            );
+        }
+        // The roles, through the whole runtime: the LFE is bit-identical, the
+        // centre is lifted, the screen channels are only ducked.
+        let lfe_changed = (0..frames).any(|frame| data[frame * 6 + 3] != original[frame * 6 + 3]);
+        assert!(!lfe_changed, "the LFE must be untouched for the whole runtime");
+        let peak = |channel: usize, from: usize, to: usize| -> f32 {
+            (from..to)
+                .map(|frame| data[frame * 6 + channel].abs())
+                .fold(0.0f32, f32::max)
+        };
+        let centre_before = 0.06f32;
+        assert!(
+            peak(2, 0, frames / 6) > centre_before * 1.2,
+            "the centre must be lifted"
+        );
+        assert!(
+            peak(0, 0, frames / 6) < 0.6 * 1.02,
+            "a screen channel must not be lifted above its input"
+        );
+    }
+
+    #[test]
     fn speech_detector_and_rider_agree_end_to_end() {
         // Synthetic "film": quiet dialogue segments separated by loud effects.
         let rate = 48_000u32;

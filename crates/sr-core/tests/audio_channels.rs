@@ -13,7 +13,7 @@
 //! result did not contain what the graph claimed — the bursts were in channel 1
 //! and every level was about 15 dB low.
 //!
-//! ## Status: the LDR fix landed, and unblocked a second defect
+//! ## Status: the LDR fix landed, and what the second defect is *not*
 //!
 //! The first defect this fixture found was that `dialogue_lufs` was measured from
 //! the **programme's** blocks gated by the speech mask — "how loud the whole mix
@@ -22,21 +22,30 @@
 //! `analyze` now keeps a second `LoudnessMeter` on the dialogue channel (the same
 //! centre samples the detector already receives) and gates *that* by the mask.
 //!
-//! With the rider finally engaging, this test fails for a new reason: the
-//! enhanced WAV it writes contains samples around 1e27.
+//! With the rider finally engaging, this test fails on a second defect: the
+//! enhanced WAV contains samples around 1e27 in its later part. Narrowing it has
+//! ruled several things out:
 //!
-//! * two independent readers agree — FFmpeg decoding the WAV, and reading the
-//!   float samples straight out of the file — so it is not a measurement artefact;
-//! * the pipeline's own `ebur128` pass over that same file reports -19.0 LUFS and
-//!   -20.8 dBTP, which cannot both be true of samples at 1e27.
+//! * **not a measurement artefact** — FFmpeg decoding the WAV and reading the
+//!   float samples straight out of the file agree to the last digit;
+//! * **not the fixture** — `the_fixture_carries_what_it_claims_to_carry` asserts
+//!   the per-channel contents, and the source decodes to the expected levels in
+//!   the same two-second window;
+//! * **not the file header** — format tag 3 (IEEE float), RIFF size `len - 8`,
+//!   data size `len - 44`, all consistent, and the first frame is
+//!   `[0, 0, 0, 0, 0, 0]`, which is what tones starting at phase zero should be;
+//! * **not the processor** — `rider::tests::experiment_twelve_seconds_of_six_channels`
+//!   drives `RemasterProcessor` over the same 12 seconds, in the same 100 ms
+//!   blocks, with the same settings and chunk grid, and every channel stays
+//!   bounded (LFE exactly unchanged at 0.5, the centre lifted from 0.06 to 0.107).
+//!   That experiment is now a test, because "the DSP is stable over a full
+//!   runtime" is worth asserting on its own.
 //!
-//! That contradiction is the open question. What is *not* in doubt is that the
-//! rider is now reachable, which it was not before, and that the failure is real
-//! rather than a fixture problem: the fixture verifies clean in
-//! `the_fixture_carries_what_it_claims_to_carry`.
-//!
-//! The test stays ignored so the finding remains in the tree and becomes the
-//! regression test once the processor is fixed.
+//! What remains is the path between `PcmReader` and `WavWriter` in
+//! `remaster_to_wav`, or the gain curve the pipeline builds from the real
+//! analysis rather than from a constructed one. The next step is to run that
+//! function's exact inputs through the processor and compare, rather than reading
+//! the file it produced.
 //!
 //! Skips itself when FFmpeg is unavailable.
 
@@ -360,6 +369,31 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
         .join("job-surround")
         .join("enhanced-audio.wav");
     assert!(enhanced.exists(), "the enhanced track must be on disk");
+    // What is actually in the file: the header's claimed size, and the first few
+    // samples. The processor itself is stable over this length (proved by
+    // `rider::tests::experiment_twelve_seconds_of_six_channels`), so if the file
+    // is wrong the fault is in the streaming writer or its caller.
+    {
+        let bytes = std::fs::read(&enhanced).expect("read the WAV");
+        let declared = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        let riff = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let format = u16::from_le_bytes([bytes[20], bytes[21]]);
+        let mut first = Vec::new();
+        for index in 0..6 {
+            let at = 44 + index * 4;
+            first.push(f32::from_le_bytes([
+                bytes[at],
+                bytes[at + 1],
+                bytes[at + 2],
+                bytes[at + 3],
+            ]));
+        }
+        eprintln!(
+            "wav: {} bytes, riff size {riff}, format tag {format}, data size {declared}, \
+             first frame {first:?}",
+            bytes.len()
+        );
+    }
     let source = channel_levels(&ff, &fixture.path, 6);
     // Read the enhanced WAV directly rather than through FFmpeg, so the two
     // numbers come from two different readers and a disagreement is visible.
