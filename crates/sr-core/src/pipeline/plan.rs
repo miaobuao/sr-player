@@ -617,6 +617,24 @@ pub fn model_output_geometry(video: &VideoPlan) -> (u32, u32) {
     }
 }
 
+/// Whether a plan has to run on the chunked executor.
+///
+/// A network is not an FFmpeg filter, so any plan that runs one does. This is a
+/// function rather than an inline condition because it was an inline condition that
+/// was wrong: restoration was left out of it, so `--profile safe-16gb
+/// --interpolate off` planned a *single FFmpeg pass* and restored nothing, while the
+/// plan line and the log header both still said restoration was on. Silent
+/// non-performance of a model task, reachable from the command line, is the exact
+/// failure this architecture exists to remove, and it deserves a test rather than a
+/// comment.
+pub fn needs_chunked_executor(
+    interpolation_enabled: bool,
+    restoration_enabled: bool,
+    has_regrain: bool,
+) -> bool {
+    interpolation_enabled || restoration_enabled || has_regrain
+}
+
 /// Refuses a restoration request that nothing in this binary can serve.
 ///
 /// The alternative that used to be here — carry on, reach the target raster with
@@ -876,10 +894,14 @@ pub fn build_plan(
     // its neighbour, so a measured per-shot re-grain forces it. The model stage
     // will force it for the same reason — a network is not an FFmpeg filter —
     // but there is no model stage in this build, so nothing else does.
-    let executor = if regrain_per_shot.is_empty() && !interpolation.enabled {
-        VideoExecutor::FfmpegSinglePass
-    } else {
+    let executor = if needs_chunked_executor(
+        interpolation.enabled,
+        profile.restoration.enabled,
+        !regrain_per_shot.is_empty(),
+    ) {
         VideoExecutor::Chunked
+    } else {
+        VideoExecutor::FfmpegSinglePass
     };
     let measured_shots = regrain_per_shot.len();
 
@@ -1245,6 +1267,27 @@ mod tests {
     }
 
     #[test]
+    /// The bug this pins, in full: restoration was left out of the executor
+    /// condition, so `--profile safe-16gb --interpolate off` planned a single FFmpeg
+    /// pass. FFmpeg cannot run a network, so the run restored nothing at all while
+    /// the plan line and the log header both said restoration was on. That is silent
+    /// non-performance of a model task, reachable from the command line, and it is
+    /// the precise failure this whole architecture exists to remove.
+    #[test]
+    fn a_plan_that_runs_a_model_never_uses_the_single_pass_executor() {
+        // Restoration alone. This is the case that was wrong.
+        assert!(needs_chunked_executor(false, true, false));
+        // Interpolation alone.
+        assert!(needs_chunked_executor(true, false, false));
+        // Re-grain alone, which is a filter and *could* be done in one pass, but the
+        // per-shot estimator means it is not.
+        assert!(needs_chunked_executor(false, false, true));
+        // Everything together.
+        assert!(needs_chunked_executor(true, true, true));
+        // And only a plan with no model and no re-grain may take the single pass.
+        assert!(!needs_chunked_executor(false, false, false));
+    }
+
     fn interpolation_off_resolves_to_a_plan_that_changes_no_frame_rate() {
         let mut profile = RestorationProfile::safe_16gb();
         profile.interpolation.method = InterpolationMethod::Off;
