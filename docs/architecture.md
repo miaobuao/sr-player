@@ -227,7 +227,7 @@ quietly run a different algorithm.
 | AudioAnalysis | `ebur128` + native BS.1770 + dialogue detection → LDR decision | yes |
 | Plan | executor, geometry, encoder chain, VRAM budget, working set, reasons and warnings | yes |
 | Restore / Interpolate | a model session per job; per-segment calls; OOM walks the degrade ladder | per chunk |
-| Regrain | FFmpeg noise after the model (no per-shot grain estimator in this build) | n/a |
+| Regrain | grain measured per shot from the source, then applied per chunk | per chunk |
 | AudioProcess | dialogue rider + band duck → float WAV on disk (never in RAM) | chunk row |
 | Encode | native path: one encode per chunk + concat; deterministic path: one FFmpeg pass | per chunk |
 | Mux | concatenated video + enhanced track + originals + subtitles + attachments + chapters | progress events |

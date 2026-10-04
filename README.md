@@ -118,29 +118,28 @@ graph with a nicer name:
 ## Verification
 
 ```powershell
-cargo test --workspace                     # 217 tests: 207 unit + 3 end-to-end + 1 model-execution + 1 gpu-execution + 5 gpu kernels
+cargo test --workspace                     # 280 tests, 2 ignored (see Status below)
 powershell -File testdata\make_fixture.ps1 # 8 s DVD-shaped fixture (the long-form check)
 cargo run -p sr-cli -- analyze testdata\sample-dvd.mkv
 cargo run -p sr-cli -- convert testdata\sample-dvd.mkv -o testdata\out.mkv
 cargo run -p sr-cli -- probe   testdata\out.mkv
 ```
 
-`crates/sr-core/tests/end_to_end.rs` builds its own fixture with FFmpeg and runs
-the real pipeline over it, so `cargo test` alone proves the central claim: a
-video goes in, a correctly converted one comes out, the job emits exactly one
-`Finished` event, the output keeps its audio/subtitle/chapter streams, a dry run
-writes nothing, and a missing input fails as a job rather than a panic. It skips
-itself with a message when FFmpeg is not installed.
+The corpus tests build their own fixtures with FFmpeg and assert what the *engine*
+did with them, not what the code looks like it would do:
 
-`crates/sr-core/tests/native_execution.rs` is the one that keeps the AI path
-honest. It points the engine at the reference plugin and checks what is only true
-when frames really went through it: the plugin logged a call (it can only do that
-from inside `sr_infer_execute`), **no call's frame range contained a cut**, the
-output has exactly `2×(n−1)+1` frames at twice the source rate, the output
-contains distinct frames the source never had (so it is not a duplication
-fallback), an injected out-of-memory fault is answered by the degrade ladder
-instead of failing the job, and a second run reuses the committed chunks without
-calling the model again.
+| file | what only it proves |
+|---|---|
+| `end_to_end.rs` | a video goes in and a converted one comes out; one `Finished` event; streams preserved; a dry run writes nothing |
+| `native_execution.rs` | frames really went through the model: no call's range contained a cut, `2×(n−1)+1` frames, frames the source never had, an injected OOM answered by the degrade ladder |
+| `resume.rs` | an interrupted job reuses its committed chunks, recomputes exactly the rest, and produces a frame-identical film |
+| `gpu_execution.rs` | the engine drives the Vulkan backend over a real file and reports its capabilities truthfully |
+| `restore.rs` | `SR_OP_RESTORE` executes through the ABI and every output slot is written |
+| `cadence_corpus.rs` | a real 3:2 pulldown is classified telecine, inverse telecine gives back the frame count, the chain reaches 95 frames at 47.952 |
+| `corpus_formats.rs` | anamorphic pixels are squared before the model sees them; true interlacing is deinterlaced and never decimated; PAL stays 25 fps |
+| `corpus_timing.rs` | a variable frame rate keeps its runtime; a source starting at ten seconds comes out starting at zero |
+| `grain_execution.rs` | per-shot grain reaches the encoder: the heavy shot returns to its source amplitude |
+| `audio_channels.rs` | the rider's channel plan, per channel, on a 5.1 file |
 
 The `testdata` fixture is deliberately awkward: 720×480 MPEG-2 at 29.97 with two
 hard cuts, a 5.1 AC-3 track (dialogue in the centre channel) plus a second
@@ -148,45 +147,77 @@ stereo track, a subtitle track, chapters and a font attachment. A verified run
 reports 3 shots / 2 cuts, and the output keeps the enhanced 5.1 track **plus
 both original tracks**, the subtitle, the attachment and both chapters.
 
+## Status: what works, and what is scaffold
+
+Most of this project is machinery whose *effect* has not been demonstrated, and the
+distinction matters more than any single feature. A capability can be fully
+implemented, fully tested, and still produce no improvement, because what decides
+picture quality is the weights — and there are none.
+
+| capability | mechanism | what it does today | evidence |
+|---|---|---|---|
+| Plugin path runs decode → model → encode | yes | runs, per chunk, with resume | `native_execution.rs`, `resume.rs` |
+| Inference ABI v2 | yes | sessions, devices, windows, tiling, OOM, fences | `gpu_execution.rs`, `restore.rs` |
+| RIFE-class interpolation | **the graph, operators and checkpoint loader** | **nothing: no checkpoint ships** | `ifnet.rs`, `ifnet_gpu.rs` |
+| Residual restoration | **the graph and the sub-pixel operator** | **nothing: the scaffold is an identity upscaler** | `restore.rs` |
+| Learned backend reaches the engine | yes — `SR_OP_RESTORE` advertised | the engine will select it; the result is unchanged pictures | `gpu_execution.rs` |
+| Interpolation that invents detail | no — the GPU backend is a block matcher | smooths motion, cannot invent | `motion.rs` |
+| The final resize | no — Lanczos, labelled as such in the plan | resizes | `corpus_formats.rs` |
+| Per-shot grain | **measured and applied per chunk** | **verified on the heavy shot only** (below) | `grain_execution.rs` |
+| Resume after a clean interruption | yes | completed chunks are reused, output is frame-identical | `resume.rs` |
+| Resume after a `kill -9` | not verified | the per-chunk commit should survive it; nothing proves it | — |
+| Dialogue rider on 5.1 | yes — centre-channel semantics | acts on the centre, leaves the LFE bit-exact | unit tests in `audio::rider`; the end-to-end test is ignored |
+| QC accepts a late-starting source | yes | normalises the offset instead of reporting a failure | `corpus_timing.rs` |
+| Cadence: telecine, interlaced, PAL | yes | 60 → 48 → 95 frames at 47.952 on a real pulldown | `cadence_corpus.rs` |
+
+The two rows in bold are where "implemented" and "works" come apart, and they are the
+rows that decide whether this is a restoration system or a framework with a slot. The
+graphs are real — a three-level coarse-to-fine interpolator, a residual restorer with
+sub-pixel upsampling, both verified on the device against invariants that a wrong
+implementation cannot satisfy — and neither does anything useful without weights.
+
+**Nothing in the tree should be read as "the quality chain is done."** Two tests are
+ignored, both with their reasons in the code: a one-frame flash is still detected as a
+shot cut, and the audio channel-plan measurement contradicts its own evidence.
+
 ## Deliberate limitations
 
-These are stated rather than hidden:
+Stated rather than hidden:
 
-* **No learned model ships.** The plugin ABI (v2) can carry RIFE-class
-  interpolation and SeedVR2-class restoration — sessions, devices, multi-frame
-  windows, dtypes, tiling, memory budgets, out-of-memory feedback — and the
-  executor that drives it is real, as is the Vulkan backend. What the GPU backend
-  implements is *search-based* motion compensation, not a network: it finds flow
-  instead of learning it, so it cannot invent detail and it does not restore.
-  The in-tree reference plugin is a test instrument (blend + unsharp mask) whose
-  job is to keep the ABI honest and the degrade ladder testable. Without a plugin
-  the engine is deterministic: it resamples, corrects cadence, remasters audio and
-  encodes, and invents nothing.
+* **No learned model ships.** The ABI carries RIFE-class interpolation and
+  SeedVR2-class restoration, the executor that drives it is real, the Vulkan backend
+  is real, and the network machinery — checkpoint format, operators, coarse-to-fine
+  topology, sub-pixel upsampling, device execution — is built and tested. There are
+  no weights. The GPU backend's *interpolation* is search-based motion compensation
+  and its *restoration* is an identity upscaler until a checkpoint is supplied.
+  Without a plugin the engine is deterministic: it resamples, corrects cadence,
+  remasters audio and encodes, and invents nothing.
 * **The model path transfers frames through host memory.** The ABI has a
   device-handle path (`SR_MEM_DEVICE`) for zero-copy, but the executor hands over
   host buffers today, so each call pays two uploads and a download. Fine for a
   preprocess-and-watch run; not how you would stream a two-hour feature at speed.
 * **Lanczos still does the final resize.** A model that restores at source
   resolution is not a super-resolution model; the deterministic upscale to the
-  target raster is labelled as such in the plan.
-* **Re-grain is off by default.** Grain costs bitrate and fights the encoder;
-  the per-shot grain estimator is not part of this build, so the knob exists but
-  is not guessed at.
-* **Black-bar cropping is not implemented.** Bars are still detected by nothing
-  and cropped by nothing.
-* **HDR sources bypass the SDR path** (with a warning) rather than being
-  tone-mapped silently.
+  target range is labelled as such in the plan, and "demote Lanczos to a fallback" is
+  not something that can be done before there is something to fall forward to.
+* **Re-grain is off by default, and one measurement contradicts its own result.**
+  The per-shot estimator runs, its amplitudes reach the per-chunk encoder, and the
+  heavy shot of the test fixture comes back at its source grain. The quiet half of
+  the same run measured *lower* with re-grain than without, which adding noise cannot
+  cause; that is recorded in `grain_execution.rs` as an open question rather than
+  asserted away.
+* **Only the per-chunk executor can vary a filter across a film.** FFmpeg's `noise`
+  filter takes one constant, so the single-pass path applies one strength to
+  everything and the plan says so.
+* **Black-bar cropping is not implemented.** Bars are detected by nothing and
+  cropped by nothing.
+* **HDR sources bypass the SDR path** (with a warning) rather than being tone-mapped
+  silently.
 * **5.1 dialogue uses the centre channel**, not source separation. There is no
   DX/MX/FX model in this build; when the detector is unsure it says so.
-* **PAL speed-down is never automatic** (25 → 24 fps would change duration,
-  pitch, subtitles and chapters; low-confidence automatic changes are worse than
-  no change).
-* **Black-bar cropping is not implemented.** Bars are still detected by nothing
-  and cropped by nothing.
-* **HDR sources bypass the SDR path** (with a warning) rather than being
-  tone-mapped silently.
-* **5.1 dialogue uses the centre channel**, not source separation. There is no
-  DX/MX/FX model in this build; when the detector is unsure it says so.
-* **PAL speed-down is never automatic** (25 → 24 fps would change duration,
-  pitch, subtitles and chapters; low-confidence automatic changes are worse than
-  no change).
+* **PAL speed-down is never automatic** (25 → 24 fps would change duration, pitch,
+  subtitles and chapters; a low-confidence automatic change is worse than none).
+* **A one-frame flash is treated as a shot cut.** Nothing interpolates across a shot
+  boundary, so this costs interpolation at every flash and multiplies the chunk count
+  — a fade to white would fragment a take. The flash guard is not written.
+
