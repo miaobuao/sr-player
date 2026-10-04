@@ -79,7 +79,7 @@ impl AppView {
                 view.job
                     .note(Level::Info, None, format!("FFmpeg {}", engine.ffmpeg_version()));
                 view.job
-                    .note(Level::Info, None, engine.engines().summary());
+                    .note(Level::Info, None, engine.ai_runtime().to_string());
             }
             None => {
                 if let Some(err) = &view.startup_error {
@@ -410,14 +410,13 @@ impl AppView {
     }
 
     fn render_header(&self) -> AnyElement {
-        // Chrome shows only a readiness indicator; the versions and the
-        // per-engine detail live in the 推理引擎 panel, which is where someone
-        // debugging a backend will look for them.
-        let engines = match self.engine.as_ref() {
-            Some(engine) => {
-                let (ready, total) = engine.engine_readiness();
-                format!("引擎 {ready}/{total} 就绪")
-            }
+        // The chrome shows one short indicator; the full sentence lives in the
+        // AI 运行时 panel, which is where someone wondering why a film was not
+        // restored will look. The wording is a UI string, so it lives here rather
+        // than in the engine: when the native runtime lands, this becomes its
+        // device and model line.
+        let runtime = match self.engine.as_ref() {
+            Some(_) => "AI 未接入".to_string(),
             None => "引擎不可用".into(),
         };
 
@@ -449,7 +448,7 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(widgets::tag(engines)),
+                    .child(widgets::tag(runtime)),
             )
             .into_any_element()
     }
@@ -1036,29 +1035,14 @@ impl AppView {
             plan.push(widgets::warning(format!("⚠ {warning}")));
         }
 
-        let engine_rows = self
-            .engine
-            .as_ref()
-            .map(|engine| engine.engines().report_rows())
-            .unwrap_or_default();
-        let engines = if engine_rows.is_empty() {
-            vec![widgets::hint("没有可用的推理引擎")]
-        } else {
-            // The panel owns the full detail: the exact FFmpeg build line and what
-            // the registry concluded, before the per-engine rows.
-            let mut rows = match self.engine.as_ref() {
-                Some(engine) => vec![
-                    ("FFmpeg".to_string(), engine.ffmpeg_version().to_string()),
-                    (
-                        "结论".to_string(),
-                        engine.engines().summary(),
-                    ),
-                ],
-                None => Vec::new(),
-            };
-            rows.extend(engine_rows);
-            widgets::kv_rows(&rows)
+        let ai_rows = match self.engine.as_ref() {
+            Some(engine) => vec![
+                ("FFmpeg".to_string(), engine.ffmpeg_version().to_string()),
+                ("AI 运行时".to_string(), engine.ai_runtime().to_string()),
+            ],
+            None => Vec::new(),
         };
+        let ai = widgets::kv_rows(&ai_rows);
 
         div()
             .id("info-scroll")
@@ -1073,7 +1057,7 @@ impl AppView {
             .track_scroll(&self.info_scroll)
             .child(widgets::card("媒体信息", media))
             .child(widgets::card("转换计划", plan))
-            .child(widgets::card("推理引擎", engines))
+            .child(widgets::card("AI 运行时", ai))
             .into_any_element()
     }
 

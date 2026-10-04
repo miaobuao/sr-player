@@ -97,7 +97,6 @@
 mod support;
 
 use sr_core::ffmpeg::{capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::media::probe;
 use sr_core::pipeline::plan::PlanRequest;
 use sr_core::pipeline::profile::InterpolationMethod;
@@ -365,9 +364,6 @@ fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
     totals.into_iter().map(|total| total / count).collect()
 }
 
-#[test]
-
-
 // What the guard fixed, and what this test now fails on:
 //
 // The corruption is gone. The enhanced track is 3,456,000 samples = 12.000000s,
@@ -403,7 +399,6 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let events = bus.subscribe();
     let runner = PipelineRunner::new(
         Arc::clone(&ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(&ff))),
         bus.clone(),
         Arc::clone(&store),
         Arc::new(AtomicBool::new(false)),

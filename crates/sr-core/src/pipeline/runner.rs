@@ -22,7 +22,6 @@ use crate::events::{
 };
 use crate::ffmpeg::{args, run_tool, Ffmpeg, RunSpec, SelectedVideoEncoder};
 use crate::gpu;
-use crate::infer::EngineRegistry;
 use crate::media::classify::classify;
 use crate::media::manifest::MediaManifest;
 use crate::media::probe::probe;
@@ -37,17 +36,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// One line for the log header, saying which neural networks this binary can run.
+///
+/// It is a function rather than a literal because it is the single place that has
+/// to change when the native runtime arrives: today there is none, so the honest
+/// answer is that no restoration and no interpolation can run, and the plan will
+/// refuse either rather than substitute something else.
+pub fn ai_runtime_line() -> &'static str {
+    "AI runtime: none in this build — restoration and interpolation are refused, not approximated"
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunnerOptions {
     pub resume: bool,
     pub keep_intermediates: bool,
     /// Stop after the plan is produced, without touching any pixels.
     pub dry_run: bool,
-    pub max_degrade_retries: u32,
-    /// Retries for a chunk failure that is not about capacity. One is enough for a
-    /// hiccup; more would turn a persistent fault into a slow failure.
-    pub max_chunk_retries: u32,
-    /// How the native executor stores its per-chunk checkpoints.
+    /// How the chunked executor stores its per-chunk checkpoints.
     pub chunk_encoding: ChunkEncoding,
 }
 
@@ -57,8 +62,6 @@ impl Default for RunnerOptions {
             resume: true,
             keep_intermediates: false,
             dry_run: false,
-            max_degrade_retries: 4,
-            max_chunk_retries: 1,
             // FFV1 intermediates: one encode at the end, so the published file
             // cannot depend on where the chunk boundaries happened to fall.
             chunk_encoding: ChunkEncoding::LosslessIntermediate,
@@ -97,7 +100,6 @@ impl QcReport {
 
 pub struct PipelineRunner {
     ff: Arc<Ffmpeg>,
-    engines: Arc<EngineRegistry>,
     bus: EventBus,
     store: Arc<Store>,
     cancel: Arc<AtomicBool>,
@@ -107,7 +109,6 @@ pub struct PipelineRunner {
 impl PipelineRunner {
     pub fn new(
         ff: Arc<Ffmpeg>,
-        engines: Arc<EngineRegistry>,
         bus: EventBus,
         store: Arc<Store>,
         cancel: Arc<AtomicBool>,
@@ -115,7 +116,6 @@ impl PipelineRunner {
     ) -> Self {
         PipelineRunner {
             ff,
-            engines,
             bus,
             store,
             cancel,
@@ -291,7 +291,7 @@ impl PipelineRunner {
 
         reporter.info(None, format!("sr-core {} · {}", crate::VERSION, self.ff.version));
         reporter.info(None, format!("GPU: {}", gpu::describe(&gpu::probe())));
-        reporter.info(None, self.engines.summary());
+        reporter.info(None, ai_runtime_line());
         reporter.info(
             None,
             format!(
@@ -423,7 +423,6 @@ impl PipelineRunner {
         let plan = self.run_stage(reporter, resume, job_id, Stage::Plan, |_| {
             build_plan(
                 &self.ff,
-                &self.engines,
                 &manifest,
                 &temporal,
                 &scenes,
@@ -487,7 +486,7 @@ impl PipelineRunner {
                         StageStatus::Degraded,
                         Some(err.to_string()),
                     );
-                    return self.encode(request, &plan, None, reporter, options, &scratch);
+                    return self.encode(request, &plan, None, reporter, &scratch);
                 }
             };
             self.store.commit_chunk(
@@ -525,11 +524,11 @@ impl PipelineRunner {
         };
 
         // ---- encode + mux + qc --------------------------------------------
-        let output = if plan.video.uses_model() {
+        let output = if plan.video.is_chunked() {
             // A failure here is *not* silently replaced by a deterministic encode.
             // That fallback used to exist and it produced a file the plan's own QC
             // then rejected — "planned 48 fps, got 24" — which hides the real
-            // reason. The model path resumes from its committed chunks, so the
+            // reason. The chunked path resumes from its committed chunks, so the
             // cheap recovery is to run the job again, not to publish something
             // nobody asked for.
             match self.native_video(
@@ -547,8 +546,8 @@ impl PipelineRunner {
                     reporter.error(
                         Some(Stage::Encode),
                         format!(
-                            "the native inference path failed: {err}\n  the chunks that finished \
-                             are committed, so running this job again resumes from the last one; \
+                            "the chunked path failed: {err}\n  the chunks that finished are \
+                             committed, so running this job again resumes from the last one; \
                              `--profile deterministic` runs the model-free path instead"
                         ),
                     );
@@ -566,7 +565,6 @@ impl PipelineRunner {
                 &plan,
                 remastered.as_deref(),
                 reporter,
-                options,
                 &scratch,
             )?
         };
@@ -610,20 +608,21 @@ impl PipelineRunner {
     /// States, before any pixel moves, which stages the chosen executor really
     /// runs.
     ///
-    /// The baseline engine folds restoration, interpolation and muxing into a
-    /// single FFmpeg pass. The native executor does something categorically
-    /// different: it decodes frames, pushes them through a model, and checkpoints
-    /// each chunk. The ladder must reflect which one is about to happen, because
-    /// "interpolation: done" means two very different things in those two cases.
+    /// "Interpolation: done" means two very different things depending on the
+    /// executor, so the ladder must reflect which one is about to happen. In this
+    /// build neither model stage runs at all — a plan that asked for one is
+    /// refused before it gets here — so what the ladder mostly has to get right is
+    /// the *skipped* wording, which is what a user reads when they wonder why
+    /// their DVD was not restored.
     fn announce_video_stages(&self, reporter: &Reporter, plan: &ConversionPlan) {
-        if !plan.video.uses_model() {
+        if !plan.video.is_chunked() {
             if plan.video.upscale_factor > 1.01 {
                 reporter.stage(
                     Stage::Restore,
                     StageStatus::Skipped,
                     Some(format!(
-                        "no model backend: the {:.2}x upscale is a deterministic Lanczos resample \
-                         folded into the encode, and invents no detail",
+                        "no restoration network in the path: the {:.2}x upscale is a deterministic \
+                         Lanczos resample folded into the encode, and invents no detail",
                         plan.video.upscale_factor
                     )),
                 );
@@ -631,96 +630,70 @@ impl PipelineRunner {
                 reporter.stage(
                     Stage::Restore,
                     StageStatus::Skipped,
-                    Some("source resolution kept; no restoration engine requested".into()),
+                    Some("source resolution kept; no restoration requested".into()),
                 );
             }
-            if plan.video.interpolation.enabled {
-                reporter.stage(
-                    Stage::Interpolate,
-                    StageStatus::Done,
-                    Some(format!(
-                        "{} folded into the encode; cut detection is FFmpeg's, not the engine's",
-                        plan.video.interpolation.method.as_str()
-                    )),
-                );
-            } else {
-                reporter.stage(
-                    Stage::Interpolate,
-                    StageStatus::Skipped,
-                    Some("interpolation disabled".into()),
-                );
-            }
+            reporter.stage(
+                Stage::Interpolate,
+                StageStatus::Skipped,
+                Some(format!(
+                    "{}: no frame is resampled and none is synthesised",
+                    plan.video.interpolation.method.as_str()
+                )),
+            );
             reporter.stage(
                 Stage::Regrain,
                 StageStatus::Skipped,
                 Some(if plan.video.regrain_strength > 0.0 {
                     format!(
-                        "re-grain strength {:.0} folded into the encode (FFmpeg noise, not a \
-                         per-shot grain model)",
+                        "one constant strength {:.0} folded into the encode; per-shot grain needs \
+                         the chunked executor, which a measured re-grain selects",
                         plan.video.regrain_strength
                     )
                 } else {
-                    "re-grain disabled (no per-shot grain estimator in this build)".to_string()
+                    "re-grain disabled".to_string()
                 }),
             );
             return;
         }
 
-        let inference = plan.video.inference.as_ref().expect("native plan");
-        if inference.describes("restore") {
-            reporter.stage(
-                Stage::Restore,
-                StageStatus::Running,
-                Some(format!(
-                    "{} restores every frame through a model session at {}x{}, strength {:.2}",
-                    inference.engine_id,
-                    inference.width,
-                    inference.height,
-                    inference.restore_strength
-                )),
-            );
-        } else {
-            reporter.stage(
-                Stage::Restore,
-                StageStatus::Skipped,
-                Some("the model handles interpolation only; no restoration was requested".into()),
-            );
-        }
-        if inference.describes("interpolate") {
-            reporter.stage(
-                Stage::Interpolate,
-                StageStatus::Running,
-                Some(format!(
-                    "{} synthesises {:.3} fps from {:.3} fps, one shot at a time: a frame pair \
-                     that straddles a cut is never handed to the model",
-                    inference.engine_id,
-                    plan.video.interpolation.target_fps.to_f64(),
-                    plan.video.interpolation.source_fps.to_f64()
-                )),
-            );
-        } else {
-            reporter.stage(
-                Stage::Interpolate,
-                StageStatus::Skipped,
-                Some(format!(
-                    "{} (no model interpolation selected)",
-                    plan.video.interpolation.method.as_str()
-                )),
-            );
-        }
+        // Chunked: the per-shot work really does happen a chunk at a time, and the
+        // model stages are still absent — `build_plan` would have refused the job
+        // outright if either had been asked for.
         reporter.stage(
-            Stage::Regrain,
+            Stage::Restore,
             StageStatus::Skipped,
-            Some(if plan.video.regrain_strength > 0.0 {
-                format!(
-                    "re-grain strength {:.0} applied by FFmpeg after the model (not a per-shot \
-                     grain model)",
-                    plan.video.regrain_strength
-                )
-            } else {
-                "re-grain disabled (no per-shot grain estimator in this build)".to_string()
-            }),
+            Some(
+                "no restoration network in this build; a plan that asked for one is refused \
+                 rather than resampled"
+                    .into(),
+            ),
         );
+        reporter.stage(
+            Stage::Interpolate,
+            StageStatus::Skipped,
+            Some(
+                "no interpolator in this build; a plan that asked for one is refused rather than \
+                 duplicated"
+                    .into(),
+            ),
+        );
+        if plan.video.regrain_per_shot.is_empty() {
+            reporter.stage(
+                Stage::Regrain,
+                StageStatus::Skipped,
+                Some("re-grain disabled".into()),
+            );
+        } else {
+            reporter.stage(
+                Stage::Regrain,
+                StageStatus::Running,
+                Some(format!(
+                    "{} shot(s) measured; each chunk is encoded with its own `noise` strength",
+                    plan.video.regrain_per_shot.len()
+                )),
+            );
+        }
     }
 
     fn encode(
@@ -729,7 +702,6 @@ impl PipelineRunner {
         plan: &ConversionPlan,
         remastered: Option<&Path>,
         reporter: &Reporter,
-        options: &RunnerOptions,
         scratch: &Path,
     ) -> Result<PathBuf> {
         // Measure the enhanced track to calibrate the final gain.
@@ -740,8 +712,6 @@ impl PipelineRunner {
             crate::pipeline::plan::output_extension(&plan.output_settings)
         ));
 
-        let mut working_set = plan.working_set.clone();
-        let mut attempt = 0u32;
         let mut encoder_index = 0usize;
         let mut last_error: Option<Error> = None;
         reporter.stage(Stage::Encode, StageStatus::Running, None);
@@ -787,41 +757,18 @@ impl PipelineRunner {
                     break;
                 }
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(err) if err.is_oom() && attempt < options.max_degrade_retries => {
-                    match working_set.degrade() {
-                        Some(change) => {
-                            attempt += 1;
-                            reporter.warn(
-                                Some(Stage::Encode),
-                                format!(
-                                    "out of memory: {change} (attempt {}/{})",
-                                    attempt, options.max_degrade_retries
-                                ),
-                            );
-                            // Emitted as a stage event as well as stored, so the
-                            // UI's "degraded" badge reflects what actually
-                            // happened rather than only the database knowing.
-                            reporter.stage(
-                                Stage::Encode,
-                                StageStatus::Degraded,
-                                Some(change.clone()),
-                            );
-                            let _ = std::fs::remove_file(&temp_output);
-                            continue;
-                        }
-                        None => {
-                            reporter.error(
-                                Some(Stage::Encode),
-                                "out of memory and the degrade ladder is exhausted",
-                            );
-                            return Err(err);
-                        }
-                    }
-                }
                 Err(err) => {
                     // An encoder that is advertised but cannot open (a vendor
                     // encoder on another vendor's GPU, a driver too old, a
                     // missing device) must cost a retry, not the job.
+                    //
+                    // Out-of-memory lands here too, and that is deliberate. The
+                    // only working-set knob this project has is the restoration
+                    // tile, which is a property of a neural network's activation
+                    // buffers; changing it cannot free memory inside an FFmpeg
+                    // encoder, and pretending otherwise made the old ladder look
+                    // like it was doing something. Walking to the next encoder is
+                    // the honest response, and the warning says which one failed.
                     match plan.video.encoder_chain.get(encoder_index + 1) {
                         Some(next) => {
                             reporter.warn(
@@ -936,7 +883,6 @@ impl PipelineRunner {
         let loudness_chain = self.prepare_loudness_chain(remastered, plan, reporter)?;
         let executor = crate::pipeline::native::NativeExecutor::new(
             &self.ff,
-            &self.engines,
             &self.store,
             &self.cancel,
         );
@@ -949,25 +895,18 @@ impl PipelineRunner {
             reporter,
             remastered,
             loudness_chain,
-            working: plan.working_set.clone(),
             chunk_encoding: options.chunk_encoding,
-            max_degrade_retries: options.max_degrade_retries,
-            max_chunk_retries: options.max_chunk_retries,
             workdir: scratch,
         };
         let outcome = executor.run(&context)?;
-        for message in &outcome.degradations {
-            reporter.warn(Some(Stage::Encode), message.clone());
-        }
         reporter.stage(Stage::Encode, StageStatus::Done, None);
         reporter.info(
             Some(Stage::Encode),
             format!(
-                "{} chunk(s) written, {} reused from a previous run, {} model call(s), \
-                 {} output frame(s) from {} input frame(s)",
+                "{} chunk(s) written, {} reused from a previous run, {} output frame(s) from {} \
+                 input frame(s)",
                 outcome.chunks_written,
                 outcome.chunks_resumed,
-                outcome.model_calls,
                 outcome.output_frames,
                 outcome.input_frames
             ),
@@ -1404,17 +1343,19 @@ mod tests {
             target_height: 960,
             upscale_factor: 2.0,
             interpolation: InterpolationPlan {
-                enabled: true,
-                method: crate::pipeline::profile::InterpolationMethod::Duplicate,
+                enabled: false,
+                method: crate::pipeline::profile::InterpolationMethod::Off,
                 source_fps: Rational::new(24000, 1001).unwrap(),
-                target_fps: Rational::new(48000, 1001).unwrap(),
-                multiplier: 2,
-                engine: None,
+                target_fps: Rational::new(24000, 1001).unwrap(),
+                multiplier: 1,
                 scene_cuts_respected: true,
-                note: "duplication".into(),
+                note: "off".into(),
             },
             executor: crate::pipeline::plan::VideoExecutor::FfmpegSinglePass,
-            inference: None,
+            restoration: crate::pipeline::profile::RestorationSettings {
+                enabled: false,
+                ..Default::default()
+            },
             regrain_strength: 0.0,
             regrain_per_shot: Vec::new(),
             filter_chain: "scale=1440:960:flags=lanczos,framerate=fps=47.952048".into(),

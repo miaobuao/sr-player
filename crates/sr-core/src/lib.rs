@@ -7,9 +7,11 @@
 //! 1. **The UI never touches media.** `sr-core` owns probing, the timeline,
 //!    decoding, analysis, DSP, the job state machine and every FFmpeg/child
 //!    process. Front ends subscribe to [`Event`]s and read [`state::Store`].
-//! 2. **No Python, no CUDA, no vendor SDK is *required*.** FFmpeg is the only
-//!    hard external dependency. GPU inference is an optional, pluggable
-//!    accelerator ([`infer`]) — correctness never depends on it.
+//! 2. **One AI runtime, statically linked.** Every neural network runs inside
+//!    [`ai`], which is a thin Rust face over `native/sr-native` (C++/ncnn,
+//!    Vulkan). There is no second inference path, no dynamic plugin loading and
+//!    no feature flag: if the native runtime cannot run, the honest answer is
+//!    that the work did not happen, and the pipeline says so.
 //! 3. **Rational time everywhere.** No `frame_index / fps` float games; see
 //!    [`time`].
 //! 4. **Failure degrades, it does not exit.** Out-of-memory and "unavailable
@@ -27,7 +29,7 @@
 //! | [`media`] | probe/manifest, temporal classification, scene cuts, loudness, dialogue |
 //! | [`audio`] | Rust-native DSP: BS.1770 measurement, dialogue rider, band ducking, WAV |
 //! | [`pipeline`] | plan, VRAM policy, stage runner, events, checkpointing |
-//! | [`infer`] | vendor-neutral inference ABI (FFmpeg baseline + optional plugin) |
+//! | [`ai`] | the single native AI runtime: device enumeration, RIFE, Real-ESRGAN |
 //! | [`state`] | SQLite job store |
 
 pub mod audio;
@@ -35,7 +37,6 @@ pub mod error;
 pub mod events;
 pub mod ffmpeg;
 pub mod gpu;
-pub mod infer;
 pub mod media;
 pub mod pipeline;
 pub mod state;

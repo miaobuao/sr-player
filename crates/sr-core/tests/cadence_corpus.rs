@@ -21,7 +21,6 @@
 mod support;
 
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::media::classify::{classify, ClassifyOptions, TemporalMode};
 use sr_core::media::probe;
 use sr_core::media::scene::{detect_scenes, SceneDecode, SceneOptions};
@@ -45,27 +44,6 @@ fn ffmpeg_or_skip() -> Option<Arc<Ffmpeg>> {
             return None;
         }
     }
-}
-
-fn example_plugin() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let name = if cfg!(windows) {
-        "sr_infer_plugin_example.dll"
-    } else if cfg!(target_os = "macos") {
-        "libsr_infer_plugin_example.dylib"
-    } else {
-        "libsr_infer_plugin_example.so"
-    };
-    // Both paths are legitimate cargo outputs, and *which one is current depends on
-    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
-    // building it as a dependency writes `deps/`. Taking the first that existed loaded
-    // a stale binary and silently invalidated a test - the injected fault was in the
-    // newer file and never ran, and the test could not tell.
-    [dir.join(name), dir.join("deps").join(name)]
-        .into_iter()
-        .filter(|path| path.exists())
-        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
 }
 
 /// Which `TemporalMode` the classifier reports, and what it based that on.
@@ -289,26 +267,30 @@ fn inverse_telecine_puts_the_frame_count_back() {
     );
 }
 
+/// The cadence chain through the whole pipeline, model-free.
+///
+/// This used to be `the_whole_chain_runs_from_pulldown_to_double_rate` and ended
+/// at 47.952 fps / 95 frames, with RIFE doubling what inverse telecine left. The
+/// doubling half of that assertion is gone with the inference layer: there is no
+/// interpolator in this binary, and `build_plan` now refuses a plan that asks for
+/// one instead of substituting `minterpolate` or a duplicate. The refusal itself
+/// is asserted in `pipeline::plan::a_request_for_rife_is_refused_rather_than_answered_with_minterpolate`;
+/// what is asserted here is the half that still runs — 3:2 pulldown detected,
+/// removed by the decode chain, and published at the post-IVTC rate and count.
 #[test]
-fn the_whole_chain_runs_from_pulldown_to_double_rate() {
+fn the_whole_chain_runs_from_pulldown_to_the_post_ivtc_rate() {
     let Some(ff) = ffmpeg_or_skip() else {
-        return;
-    };
-    let Some(plugin) = example_plugin() else {
-        eprintln!("SKIPPED: the example inference plugin was not built");
         return;
     };
     let dir = tempfile::tempdir().expect("temp dir");
     let (_, telecined) = build_fixture(&ff, dir.path());
     let output = dir.path().join("restored.mkv");
-    std::env::set_var("SR_INFER_PLUGIN", &plugin);
 
     let store = Arc::new(Store::open(&dir.path().join("jobs.sqlite3")).expect("state store"));
     let bus = EventBus::new();
     let events = bus.subscribe();
     let runner = PipelineRunner::new(
         Arc::clone(&ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(&ff))),
         bus.clone(),
         Arc::clone(&store),
         Arc::new(AtomicBool::new(false)),
@@ -316,10 +298,10 @@ fn the_whole_chain_runs_from_pulldown_to_double_rate() {
     );
 
     let mut profile = RestorationProfile::deterministic();
-    // Interpolation from the model, everything else deterministic: the point of
-    // this test is the cadence chain, not the backend.
-    profile.interpolation.method = InterpolationMethod::Plugin;
-    profile.interpolation.multiplier = 2;
+    // No model task at all: the point of this test is the cadence chain, and a
+    // profile that asked for interpolation would be refused before the plan.
+    profile.interpolation.method = InterpolationMethod::Off;
+    profile.interpolation.multiplier = 1;
     profile.restoration.enabled = false;
     // Keep the raster at the source size so the test measures cadence rather than
     // the cost of an upscale.
@@ -381,14 +363,15 @@ fn the_whole_chain_runs_from_pulldown_to_double_rate() {
         .map(|f| f.to_f64())
         .unwrap_or(0.0);
     assert!(
-        (fps - 47.952).abs() < 0.05,
-        "the output must run at twice the post-IVTC rate, got {fps:.3} fps"
+        (fps - 23.976).abs() < 0.05,
+        "the output must run at the post-IVTC rate and not above it: 60 frames of \
+         pulldown collapse to 24p, and nothing doubles it, got {fps:.3} fps"
     );
-    // 48 frames after inverse telecine, doubled: 2*(48-1)+1 = 95.
+    // 48 frames after inverse telecine, and exactly that many published.
     let frames = count_frames(&ff, &output);
     assert_eq!(
-        frames,
-        2 * (SOURCE_FRAMES - 1) + 1,
-        "the whole chain must emit 95 frames: 60 in the file, 48 after IVTC, 95 after doubling"
+        frames, SOURCE_FRAMES,
+        "the whole chain must emit 48 frames: 60 in the file, 48 after IVTC, and no \
+         synthesised frames on top"
     );
 }

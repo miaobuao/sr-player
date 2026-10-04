@@ -11,10 +11,11 @@
 //!
 //! * `FfmpegSinglePass` — one FFmpeg pass with a filter chain. No model runs, so
 //!   nothing is restored or synthesised.
-//! * `NativeInference` — the engine decodes frames, pushes them through a model
-//!   session shot by shot, and checkpoints each chunk, so a job that dies half
-//!   way through a feature resumes at the chunk that failed instead of starting
-//!   again.
+//! * `Chunked` — the engine decodes frames, encodes each chunk with its own
+//!   per-shot filter chain, and checkpoints each one, so a job that dies half way
+//!   through a feature resumes at the chunk that failed instead of starting again.
+//!   This is what per-shot re-grain requires, and it is the shape the model stage
+//!   will need as well.
 //!
 //! Every stage checkpoints its result, and every stage reports what it did to the
 //! event bus, so the UI never has to guess.
@@ -27,16 +28,15 @@ pub mod profile;
 pub mod runner;
 pub mod segments;
 
-pub use native::{NativeExecutor, NativeOutcome};
+pub use native::{Frame, NativeExecutor, NativeOutcome};
 pub use plan::{
     build_filter_chain, build_plan, cadence_for, choose_target, AudioPlan, AudioSummary,
-    CadencePlan, ConversionPlan, InferencePlan, PlanRequest, VideoExecutor, VideoPlan,
+    CadencePlan, ConversionPlan, PlanRequest, VideoExecutor, VideoPlan,
 };
-pub use policy::{plan_vram, OffloadMode, VramBudget, WorkingSet};
+pub use policy::{plan_vram, VramBudget, WorkingSet};
 pub use profile::{
     AnalysisSettings, AudioSettings, GpuPolicy, InterpolationMethod, InterpolationSettings,
-    LoudnessTarget, OutputSettings, RestorationProfile, RestorationSettings,
-    VALID_TEMPORAL_BATCHES,
+    LoudnessTarget, OutputSettings, RestorationProfile, RestorationSettings, TILE_LADDER,
 };
-pub use runner::{PipelineRunner, QcCheck, QcReport, RunnerOptions};
+pub use runner::{ai_runtime_line, PipelineRunner, QcCheck, QcReport, RunnerOptions};
 pub use segments::{plan_run, Chunk, RunPlan, Segment, SegmentKind, SegmentOptions};

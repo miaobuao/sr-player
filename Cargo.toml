@@ -1,12 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/sr-core",
-    "crates/sr-cli",
-    "crates/sr-gui",
-    "crates/sr-infer-plugin-example",
-    "crates/sr-infer-gpu",
-]
+members = ["crates/sr-core", "crates/sr-cli", "crates/sr-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,7 +26,9 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# --- optional vendor-neutral plugin loading (never required) ---
+# --- Vulkan loader, opened at runtime purely for the GPU probe ---
+# Not an inference dependency: the AI runtime is statically linked through
+# `native/sr-native`, and nothing here loads code at runtime.
 libloading = "0.8"
 
 # --- cli ---

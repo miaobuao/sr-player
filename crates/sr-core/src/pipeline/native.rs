@@ -1,17 +1,9 @@
-//! The native inference executor: decode, model session, per-chunk encode.
-//!
-//! This is the part that was missing. Before it existed, a plan could say
-//! `InterpolationMethod::Plugin` and the runner would hand the whole job to a
-//! single FFmpeg pass, which quietly ran `minterpolate` instead of the model: the
-//! plugin was discovered, its capabilities were logged, and nothing was ever
-//! executed. Here is what actually happens now:
+//! The chunked executor: decode, per-shot encode, checkpoint.
 //!
 //! ```text
 //! ffmpeg -i in -vf <cadence>,format=rgb24 -f rawvideo   (stdout)
 //!        |
-//!        +- per segment:  carry -> window of at most N frames
-//!        |                restore      (model session)
-//!        |                interpolate  (model session)
+//!        +- per segment:  carry -> frames of at most N
 //!        |
 //!        +- per chunk:    raw frames -> ffmpeg -> chunk-00042.mkv  (checkpointed)
 //!                                              |
@@ -19,35 +11,40 @@
 //!                                                   subtitles, chapters, attachments
 //! ```
 //!
-//! Three properties are worth stating explicitly, because they are the difference
-//! between "a model ran" and "a model was supposed to run":
+//! Why this path exists at all, given a single FFmpeg pass is simpler: **grain is
+//! per shot.** FFmpeg's `noise` filter takes one constant, so a filter chain
+//! built once cannot give shot 12 a different strength from shot 13. Encoding each
+//! chunk with its own chain is the only way to vary it, and chunking brings
+//! checkpointing with it.
 //!
-//! * **The model never sees a cut.** Segments come from the shot list, and a
-//!   segment containing a boundary is executed as `Hold`: frames are repeated
-//!   instead of synthesised. Neither FFmpeg nor the model gets to make that
-//!   decision.
-//! * **Resume is per chunk.** Each chunk is its own encode, committed to the
-//!   `chunks` table with its artifact before the next one starts. A job that dies
-//!   at 95% re-runs one chunk, not the film.
-//! * **Out of memory degrades, it does not fail.** A backend answering
-//!   `SR_ERR_OUT_OF_MEMORY` walks the working-set ladder, tells the session about
-//!   the smaller working set, and the same segment runs again.
+//! What is deliberately *not* here any more: any call into a neural network. The
+//! previous version of this file drove a vendor-neutral plugin session and could
+//! fall through to FFmpeg's `minterpolate` when no plugin was installed, which
+//! made "a model ran" and "FFmpeg did something that looks similar"
+//! indistinguishable from the outside. Interpolation and restoration now go
+//! through [`crate::ai`] only, that path is being rebuilt on the native ncnn
+//! runtime, and until it exists a request for either is **refused** rather than
+//! answered differently. The segment planner in [`crate::pipeline::segments`]
+//! still computes the model-side plan — including the guarantee that no pair
+//! spanning a cut is ever synthesised — because that is the contract the runtime
+//! has to meet.
+//!
+//! Resume is per chunk. Each chunk is its own encode, committed to the `chunks`
+//! table with its artifact before the next one starts. A job that dies at 95%
+//! re-runs one chunk, not the film.
 //!
 //! Frame accounting is exact: `m` times interpolation of `n` frames emits
 //! `m*(n-1)+1` frames, and the executor fails loudly if what it wrote disagrees
 //! with the plan. A short output is never published quietly.
 
 use crate::error::{Error, Result};
-use crate::events::{Reporter, Stage, StageProgress, StageStatus};
+use crate::events::{Reporter, Stage, StageProgress};
 use crate::ffmpeg::process::{write_all, StreamingChild};
 use crate::ffmpeg::{args, run_tool, Ffmpeg, RunSpec, SelectedAudioEncoder};
-use crate::infer::abi::{FrameBuffer, JobOptions, SessionRequest};
-use crate::infer::{EngineRegistry, EngineSession, WorkingSetRequest};
 use crate::media::scene::SceneReport;
 use crate::pipeline::plan::{
     model_output_geometry, output_extension, ConversionPlan, PlanRequest, VideoPlan,
 };
-use crate::pipeline::policy::WorkingSet;
 use crate::pipeline::profile::InterpolationMethod;
 use crate::pipeline::segments::{plan_run, Chunk, RunPlan, Segment, SegmentKind, SegmentOptions};
 use crate::state::{commit_file_atomic, ChunkRow, Store};
@@ -59,6 +56,30 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// A single decoded or synthesised frame, interleaved 8-bit RGB.
+///
+/// Interleaved rather than planar because that is what the decoder produces
+/// (`-pix_fmt rgb24`) and what the chunk encoder consumes, so the common case
+/// moves no bytes at all. A model that wants planar converts on its own side of
+/// the boundary.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Frame {
+    pub fn from_owned(data: Vec<u8>, width: u32, height: u32) -> Self {
+        Frame {
+            data,
+            width,
+            height,
+        }
+    }
+}
+
 
 /// How a chunk on disk is encoded.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +100,13 @@ pub enum ChunkEncoding {
 }
 
 impl ChunkEncoding {
+    /// A human-readable name for logs.
+    ///
+    /// Deliberately *not* the same string serde writes (`lossless_intermediate`),
+    /// unlike [`crate::pipeline::plan::VideoExecutor::as_str`]: "ffv1-intermediate"
+    /// names the codec a reader will actually see in the scratch directory, which
+    /// is more useful in a log than the enum's own wording. Nothing should parse
+    /// this; `parse` accepts it, but the stored plan is the authority.
     pub fn as_str(self) -> &'static str {
         match self {
             ChunkEncoding::LosslessIntermediate => "ffv1-intermediate",
@@ -121,11 +149,7 @@ pub struct NativeContext<'a> {
     pub reporter: &'a Reporter,
     pub remastered: Option<&'a Path>,
     pub loudness_chain: Option<String>,
-    pub working: WorkingSet,
     pub chunk_encoding: ChunkEncoding,
-    pub max_degrade_retries: u32,
-    /// Retries for a chunk failure that is not about capacity.
-    pub max_chunk_retries: u32,
     /// Directory for chunk files; created if missing.
     pub workdir: &'a Path,
 }
@@ -136,31 +160,18 @@ pub struct NativeOutcome {
     pub chunks_resumed: u32,
     pub input_frames: u64,
     pub output_frames: u64,
-    pub model_calls: u64,
-    pub degradations: Vec<String>,
     pub chunk_encoding: ChunkEncoding,
 }
 
 pub struct NativeExecutor<'a> {
     ff: &'a Arc<Ffmpeg>,
-    engines: &'a Arc<EngineRegistry>,
     store: &'a Arc<Store>,
     cancel: &'a Arc<AtomicBool>,
 }
 
 impl<'a> NativeExecutor<'a> {
-    pub fn new(
-        ff: &'a Arc<Ffmpeg>,
-        engines: &'a Arc<EngineRegistry>,
-        store: &'a Arc<Store>,
-        cancel: &'a Arc<AtomicBool>,
-    ) -> Self {
-        NativeExecutor {
-            ff,
-            engines,
-            store,
-            cancel,
-        }
+    pub fn new(ff: &'a Arc<Ffmpeg>, store: &'a Arc<Store>, cancel: &'a Arc<AtomicBool>) -> Self {
+        NativeExecutor { ff, store, cancel }
     }
 
     fn check_cancel(&self) -> Result<()> {
@@ -171,25 +182,28 @@ impl<'a> NativeExecutor<'a> {
         }
     }
 
-    /// Runs the whole native video path and returns the finished output path.
+    /// Runs the whole chunked video path and returns the finished output path.
     pub fn run(&self, ctx: &NativeContext<'_>) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
-        let inference = video.inference.as_ref().ok_or_else(|| Error::Stage {
-            stage: Stage::Encode.id().into(),
-            detail: "the plan selected the native executor without an inference plan".into(),
-        })?;
-        let engine = self.engines.model_engine().ok_or_else(|| Error::Stage {
-            stage: Stage::Encode.id().into(),
-            detail: "the plan selected the native executor but no model plugin is loaded".into(),
-        })?;
-
-        let interpolate = video.interpolation.enabled
-            && video.interpolation.method == InterpolationMethod::Plugin;
-        let restore = inference.describes("restore");
-        if !interpolate && !restore {
+        // `build_plan` refuses both of these already. The check is repeated at the
+        // point of execution on purpose: "nothing is substituted" has to hold
+        // where the pixels are, not only where the plan was drawn up, and a plan
+        // can also be constructed by hand or loaded from an older job.
+        if video.interpolation.enabled && video.interpolation.method == InterpolationMethod::Rife {
             return Err(Error::Stage {
-                stage: Stage::Encode.id().into(),
-                detail: "the native executor was selected with no model task to run".into(),
+                stage: Stage::Interpolate.id().into(),
+                detail: "the plan asks for RIFE interpolation but this binary contains no AI \
+                         runtime; refusing to publish a file whose frames are not the ones the \
+                         plan describes"
+                    .into(),
+            });
+        }
+        if video.restoration.enabled {
+            return Err(Error::Stage {
+                stage: Stage::Restore.id().into(),
+                detail: "the plan asks for Real-ESRGAN restoration but this binary contains no AI \
+                         runtime; refusing to publish a file that only looks restored"
+                    .into(),
             });
         }
 
@@ -197,17 +211,17 @@ impl<'a> NativeExecutor<'a> {
         // analysis, which ran on the same cadence chain: the numbering matches by
         // construction rather than by hope.
         let input_frames = ctx.scenes.frames_analyzed;
-        let multiplier = if interpolate {
-            video.interpolation.multiplier.max(1)
-        } else {
-            1
-        };
+        let interpolate = false;
+        let multiplier = 1u32;
         let run_plan = plan_run(
             input_frames,
             multiplier,
             &ctx.scenes.shots,
             &SegmentOptions {
-                max_input_frames: inference.temporal_window,
+                // RIFE consumes a pair, so two is the window the segment planner
+                // is sized for. Nothing synthesises in this build, so this only
+                // bounds a structure that is not exercised yet.
+                max_input_frames: 2,
                 target_chunk_frames: 1000,
                 dissolve_guard_frames: 12,
                 interpolate,
@@ -239,48 +253,8 @@ impl<'a> NativeExecutor<'a> {
             });
         }
 
-        // ---- session ------------------------------------------------------
-        // The device index comes from the backend's own enumeration: the engine's
-        // Vulkan probe and the backend's device list are different lists, and on a
-        // machine with an integrated and a discrete GPU they need not agree on
-        // which is device 0.
-        let device_index = engine.preferred_device_index().unwrap_or(0);
-        let request = session_request(ctx, inference.temporal_window, device_index);
-        let mut session = engine.open_session(&request).map_err(|err| Error::Stage {
-            stage: Stage::Restore.id().into(),
-            detail: format!(
-                "could not open a model session on {}: {err}",
-                engine.display_name()
-            ),
-        })?;
-        ctx.reporter.info(
-            Some(Stage::Restore),
-            format!(
-                "model session open: {} | {} | window {} | budget {} MiB",
-                engine.display_name(),
-                if inference.model.is_empty() {
-                    "unnamed model".to_string()
-                } else {
-                    inference.model.clone()
-                },
-                inference.temporal_window,
-                ctx.working.estimated_mib()
-            ),
-        );
-
-        let mut outcome = self.execute_chunks(
-            ctx,
-            &run_plan,
-            session.as_mut(),
-            restore,
-            interpolate,
-            multiplier,
-        )?;
+        let mut outcome = self.execute_chunks(ctx, &run_plan, multiplier)?;
         outcome.output = self.finalize(ctx, &run_plan)?;
-        // Released explicitly so the log can say the model was gone before the
-        // mux started.
-        drop(session);
-        ctx.reporter.debug(Some(Stage::Restore), "model session closed");
         Ok(outcome)
     }
 
@@ -288,9 +262,6 @@ impl<'a> NativeExecutor<'a> {
         &self,
         ctx: &NativeContext<'_>,
         run_plan: &RunPlan,
-        session: &mut dyn EngineSession,
-        restore: bool,
-        interpolate: bool,
         multiplier: u32,
     ) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
@@ -309,16 +280,9 @@ impl<'a> NativeExecutor<'a> {
         })?;
 
         let (width, height) = (video.source.square_width, video.source.square_height);
-        // The model's own output size. The post chain already knows how to turn
-        // that into the target raster.
-        let model_size = {
-            let (w, h) = model_output_geometry(video.inference.as_ref());
-            if w == 0 || h == 0 {
-                (width, height)
-            } else {
-                (w, h)
-            }
-        };
+        // The size the chunk encoder must be told to expect. With no model in the
+        // path that is the source raster, rounded up to even.
+        let model_size = model_output_geometry(video);
         let frame_bytes = width as usize * height as usize * 3;
 
         let mut source = FrameSource::new(stdout, frame_bytes, width, height);
@@ -330,11 +294,8 @@ impl<'a> NativeExecutor<'a> {
             chunks_resumed: 0,
             input_frames: run_plan.input_frames,
             output_frames: 0,
-            model_calls: 0,
-            degradations: Vec::new(),
             chunk_encoding: ctx.chunk_encoding,
         };
-        let mut working = ctx.working.clone();
         let started = Instant::now();
         let mut written_slots = 0u64;
 
@@ -367,17 +328,10 @@ impl<'a> NativeExecutor<'a> {
             for segment in &run_plan.segments[chunk.first_segment..=chunk.last_segment] {
                 self.check_cancel()?;
                 frames_written += self.run_segment(
-                    ctx,
                     segment,
-                    chunk.index,
                     &mut source,
-                    session,
-                    restore,
-                    interpolate,
                     multiplier,
-                    &mut working,
                     &mut encoder,
-                    &mut outcome,
                 )?;
             }
             encoder.finish()?;
@@ -418,7 +372,7 @@ impl<'a> NativeExecutor<'a> {
             )?;
             outcome.chunks_written += 1;
             written_slots += frames_written;
-            self.report_progress(ctx, run_plan, chunk, written_slots, &outcome, &started);
+            self.report_progress(ctx, run_plan, chunk, written_slots, &started);
         }
 
         // Anything past the plan is a surprise. Draining keeps the decoder from
@@ -457,7 +411,6 @@ impl<'a> NativeExecutor<'a> {
         run_plan: &RunPlan,
         chunk: &Chunk,
         written_slots: u64,
-        outcome: &NativeOutcome,
         started: &Instant,
     ) {
         let fraction = if run_plan.input_frames > 0 {
@@ -471,11 +424,11 @@ impl<'a> NativeExecutor<'a> {
             stage: Stage::Encode,
             fraction: Some(fraction),
             detail: format!(
-                "chunk {}/{} | shot {:04} | {} model call(s){}",
+                "chunk {}/{} | shot {:04} | {} frame(s){}",
                 chunk.index + 1,
                 run_plan.chunks.len(),
                 chunk.shot + 1,
-                outcome.model_calls,
+                written_slots,
                 if chunk.protected_boundaries > 0 {
                     format!(" | {} protected region(s)", chunk.protected_boundaries)
                 } else {
@@ -493,84 +446,34 @@ impl<'a> NativeExecutor<'a> {
     /// Executes one segment, writing its frames to the chunk encoder.
     ///
     /// Returns the number of frames written.
-    #[allow(clippy::too_many_arguments)]
     fn run_segment(
         &self,
-        ctx: &NativeContext<'_>,
         segment: &Segment,
-        chunk_index: u32,
         source: &mut FrameSource,
-        session: &mut dyn EngineSession,
-        restore: bool,
-        interpolate: bool,
         multiplier: u32,
-        working: &mut WorkingSet,
         encoder: &mut ChunkEncoder,
-        outcome: &mut NativeOutcome,
     ) -> Result<u64> {
         match segment.kind {
-            SegmentKind::Synthesise => {
-                let m = multiplier.max(1) as u64;
-                let mut frames: Vec<FrameBuffer> =
-                    Vec::with_capacity(segment.input_frames() as usize);
-                for index in segment.first..=segment.last {
-                    frames.push(source.frame(index)?);
-                }
-                // Input frame k of the segment sits at output slot m*k.
-                stamp(ctx, &mut frames, |i| m * (segment.first + i as u64));
-                if restore {
-                    self.restore_batch(ctx, session, chunk_index, &mut frames, working, outcome)?;
-                }
-                // The next segment starts on this frame, and it must be the
-                // restored version of it.
-                let carry = frames.last().cloned();
-                let mut outputs: Vec<FrameBuffer> = if interpolate && multiplier > 1 {
-                    let produced = (frames.len() - 1) as u32 * multiplier + 1;
-                    let mut outputs: Vec<FrameBuffer> = (0..produced)
-                        .map(|_| FrameBuffer::new_rgb8(frames[0].width, frames[0].height))
-                        .collect();
-                    stamp(ctx, &mut outputs, |i| m * segment.first + i as u64);
-                    self.call_model(
-                        ctx,
-                        session,
-                        chunk_index,
-                        &mut frames,
-                        &mut outputs,
-                        multiplier,
-                        working,
-                        outcome,
-                    )?;
-                    outputs
-                } else {
-                    frames
-                };
-                if segment.drop_first && !outputs.is_empty() {
-                    outputs.remove(0);
-                }
-                let mut written = 0u64;
-                for frame in &outputs {
-                    encoder.write_frame(&frame.data)?;
-                    written += 1;
-                }
-                if let Some(frame) = carry {
-                    source.set_carry(segment.last, frame);
-                }
-                Ok(written)
-            }
+            SegmentKind::Synthesise => Err(Error::Stage {
+                stage: Stage::Interpolate.id().into(),
+                detail: format!(
+                    "the segment plan asked for frames synthesised between input {} and {}, but \
+                     there is no interpolator in this binary to produce them. The segment \
+                     planner is complete — it is the executor's model stage that is missing — \
+                     and inventing the missing frames some other way is exactly what this build \
+                     no longer does.",
+                    segment.first, segment.last
+                ),
+            }),
             SegmentKind::Hold => {
-                // No model call: these pairs may not be synthesised, so the frames
-                // repeat. Streamed one at a time, so a long held region costs one
-                // frame of memory rather than a thousand.
+                // Frames are repeated rather than synthesised, and a held region is
+                // streamed one frame at a time, so a long hold costs one frame of
+                // memory rather than a thousand.
                 let mut written = 0u64;
                 let mut skip_next = segment.drop_first;
-                let mut carry: Option<FrameBuffer> = None;
+                let mut carry: Option<Frame> = None;
                 for index in segment.first..=segment.last {
                     let frame = source.frame(index)?;
-                    let mut frames = vec![frame];
-                    if restore {
-                        self.restore_batch(ctx, session, chunk_index, &mut frames, working, outcome)?;
-                    }
-                    let frame = &frames[0];
                     if index == segment.last {
                         carry = Some(frame.clone());
                     }
@@ -598,182 +501,13 @@ impl<'a> NativeExecutor<'a> {
             }
             SegmentKind::Pass => {
                 let frame = source.frame(segment.first)?;
-                let mut frames = vec![frame];
-                if restore {
-                    self.restore_batch(ctx, session, chunk_index, &mut frames, working, outcome)?;
-                }
                 if segment.drop_first {
                     return Ok(0);
                 }
-                encoder.write_frame(&frames[0].data)?;
+                encoder.write_frame(&frame.data)?;
                 Ok(1)
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn call_model(
-        &self,
-        ctx: &NativeContext<'_>,
-        session: &mut dyn EngineSession,
-        chunk_index: u32,
-        inputs: &mut [FrameBuffer],
-        outputs: &mut [FrameBuffer],
-        multiplier: u32,
-        working: &mut WorkingSet,
-        outcome: &mut NativeOutcome,
-    ) -> Result<()> {
-        let mut options = JobOptions {
-            multiplier,
-            strength: restore_strength(ctx),
-            tile: tile_for(working),
-            seed: 0,
-            // The chunk index, so a plugin's own log lines up with the engine's
-            // `chunks` table when someone has to work out what happened.
-            chunk_id: chunk_index as u64,
-        };
-        let mut attempt = 0u32;
-        loop {
-            self.check_cancel()?;
-            match session.interpolate(inputs, outputs, &options) {
-                Ok(result) => {
-                    outcome.model_calls += 1;
-                    if let Some(message) = result.message {
-                        if !message.is_empty() {
-                            ctx.reporter.debug(Some(Stage::Interpolate), message);
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(err) if err.is_oom() && attempt < ctx.max_degrade_retries => {
-                    attempt += 1;
-                    match self.degrade(ctx, session, working, outcome, Stage::Interpolate)? {
-                        Some(tile) => {
-                            options.tile = tile;
-                            continue;
-                        }
-                        None => return Err(err),
-                    }
-                }
-                // A failure that is not about capacity is the driver hiccup, the
-                // device-lost, the backend that stumbled once. Retrying the same call
-                // is what makes an unattended run survive it: without this, one
-                // transient error in one chunk ends a job that may be hours long, and
-                // the resume machinery only helps if somebody notices and runs it
-                // again. Bounded, and never on cancellation — the operator asking to
-                // stop is not a hiccup.
-                Err(err)
-                    if attempt < ctx.max_chunk_retries
-                        && !matches!(err, Error::Cancelled) =>
-                {
-                    attempt += 1;
-                    ctx.reporter.warn(
-                        Some(Stage::Interpolate),
-                        format!(
-                            "chunk {chunk_index} failed ({err}); retrying, attempt \
-                             {attempt} of {}",
-                            ctx.max_chunk_retries
-                        ),
-                    );
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    /// Applies one rung of the degrade ladder.
-    ///
-    /// `Some(tile)` means "retry with this tile"; `None` means the ladder is
-    /// exhausted and the caller must report the original failure.
-    fn degrade(
-        &self,
-        ctx: &NativeContext<'_>,
-        session: &mut dyn EngineSession,
-        working: &mut WorkingSet,
-        outcome: &mut NativeOutcome,
-        stage: Stage,
-    ) -> Result<Option<Option<(u32, u32)>>> {
-        let Some(change) = working.degrade() else {
-            ctx.reporter.error(
-                Some(stage),
-                "out of memory and the degrade ladder is exhausted",
-            );
-            return Ok(None);
-        };
-        let refused = match session.reconfigure(&working_request(working)) {
-            Ok(()) => None,
-            Err(reason) => Some(reason.to_string()),
-        };
-        let detail = match &refused {
-            None => format!("out of memory: {change}"),
-            Some(reason) => format!(
-                "out of memory: {change}; the backend cannot apply it in place ({reason}), so the \
-                 segment runs again with the original configuration"
-            ),
-        };
-        ctx.reporter.warn(Some(stage), detail.clone());
-        ctx.reporter
-            .stage(stage, StageStatus::Degraded, Some(detail.clone()));
-        outcome.degradations.push(detail);
-        Ok(Some(tile_for(working)))
-    }
-
-    /// Restores frames in place, walking the degrade ladder on out-of-memory.
-    fn restore_batch(
-        &self,
-        ctx: &NativeContext<'_>,
-        session: &mut dyn EngineSession,
-        chunk_index: u32,
-        frames: &mut Vec<FrameBuffer>,
-        working: &mut WorkingSet,
-        outcome: &mut NativeOutcome,
-    ) -> Result<()> {
-        let batch = ctx
-            .plan
-            .video
-            .inference
-            .as_ref()
-            .map(|i| i.max_batch.max(1) as usize)
-            .unwrap_or(1);
-        let mut offset = 0usize;
-        while offset < frames.len() {
-            let end = (offset + batch).min(frames.len());
-            let mut attempt = 0u32;
-            loop {
-                self.check_cancel()?;
-                let options = JobOptions {
-                    multiplier: 1,
-                    strength: restore_strength(ctx),
-                    tile: tile_for(working),
-                    seed: 0,
-                    chunk_id: chunk_index as u64,
-                };
-                match session.restore(&mut frames[offset..end], &options) {
-                    Ok(result) => {
-                        outcome.model_calls += 1;
-                        if let Some(message) = result.message {
-                            if !message.is_empty() {
-                                ctx.reporter.debug(Some(Stage::Restore), message);
-                            }
-                        }
-                        break;
-                    }
-                    Err(err) if err.is_oom() && attempt < ctx.max_degrade_retries => {
-                        attempt += 1;
-                        if self
-                            .degrade(ctx, session, working, outcome, Stage::Restore)?
-                            .is_none()
-                        {
-                            return Err(err);
-                        }
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            offset = end;
-        }
-        Ok(())
     }
 
     /// Concatenates the committed chunks and muxes everything the source had.
@@ -843,20 +577,6 @@ impl<'a> NativeExecutor<'a> {
 
 // ---- frame plumbing -------------------------------------------------------
 
-/// Exact rational timestamps for a run of frames, so a model that cares about
-/// time places a synthetic frame precisely instead of accumulating float drift
-/// across a two-hour film.
-///
-/// `slot_of` yields the output slot index of each frame; the timestamp is that
-/// slot over the pipe frame rate, which is exact because both sides are integers.
-fn stamp<F: Fn(usize) -> u64>(ctx: &NativeContext<'_>, frames: &mut [FrameBuffer], slot_of: F) {
-    let den = ctx.plan.video.pipe_fps().num().max(1);
-    for (index, frame) in frames.iter_mut().enumerate() {
-        frame.pts_num = slot_of(index) as i64;
-        frame.pts_den = den;
-    }
-}
-
 /// A forward-only frame stream with the single frame of carry the segment plan
 /// needs: consecutive segments share their boundary frame.
 struct FrameSource {
@@ -865,8 +585,8 @@ struct FrameSource {
     width: u32,
     height: u32,
     next_index: u64,
-    carry: Option<(u64, FrameBuffer)>,
-    last: Option<FrameBuffer>,
+    carry: Option<(u64, Frame)>,
+    last: Option<Frame>,
     frames_read: u64,
     eof: bool,
     /// Frames invented because the stream ended before the plan did.
@@ -898,7 +618,7 @@ impl FrameSource {
     ///
     /// Callers must not ask for a frame before one they have already consumed;
     /// the carry covers the single frame that consecutive segments share.
-    fn frame(&mut self, index: u64) -> Result<FrameBuffer> {
+    fn frame(&mut self, index: u64) -> Result<Frame> {
         if let Some((held, _)) = &self.carry {
             if *held == index {
                 let (_, frame) = self.carry.take().expect("checked above");
@@ -919,7 +639,7 @@ impl FrameSource {
         Ok(frame)
     }
 
-    fn read_one(&mut self) -> Result<FrameBuffer> {
+    fn read_one(&mut self) -> Result<Frame> {
         if self.eof {
             return self.repeat_last();
         }
@@ -932,12 +652,12 @@ impl FrameSource {
             return self.repeat_last();
         }
         self.frames_read += 1;
-        let frame = FrameBuffer::from_owned(buffer, self.width, self.height);
+        let frame = Frame::from_owned(buffer, self.width, self.height);
         self.last = Some(frame.clone());
         Ok(frame)
     }
 
-    fn repeat_last(&mut self) -> Result<FrameBuffer> {
+    fn repeat_last(&mut self) -> Result<Frame> {
         self.padded += 1;
         self.last.clone().ok_or_else(|| Error::Stage {
             stage: Stage::Restore.id().into(),
@@ -954,7 +674,7 @@ impl FrameSource {
     /// The frame stored is the one the model produced (restoration happens in
     /// place), which is what the next window must contain: interpolating between
     /// a restored frame and an unrestored one would show up as a flicker.
-    fn set_carry(&mut self, index: u64, frame: FrameBuffer) {
+    fn set_carry(&mut self, index: u64, frame: Frame) {
         self.carry = Some((index, frame));
     }
 
@@ -1262,81 +982,9 @@ fn chunk_path(dir: &Path, chunk: &Chunk) -> PathBuf {
     dir.join(format!("chunk-{:05}.mkv", chunk.index))
 }
 
-fn restore_strength(ctx: &NativeContext<'_>) -> f32 {
-    ctx.plan
-        .video
-        .inference
-        .as_ref()
-        .map(|i| i.restore_strength)
-        .unwrap_or(1.0)
-}
-
-fn session_request(ctx: &NativeContext<'_>, window: u32, device_index: u32) -> SessionRequest {
-    let mut config = serde_json::json!({
-        "working_set": {
-            "batch": ctx.working.batch,
-            "block_swap": ctx.working.block_swap,
-            "vae_tile": ctx.working.vae_tile,
-            "offload": ctx.working.offload.as_str(),
-        },
-        "temporal_window": window,
-        "task": if ctx.plan.video.interpolation.method == InterpolationMethod::Plugin {
-            "interpolate+restore"
-        } else {
-            "restore"
-        },
-        "input": {
-            "width": ctx.plan.video.source.square_width,
-            "height": ctx.plan.video.source.square_height,
-            "pix_fmt": "rgb24",
-        },
-    });
-    // `SR_INFER_CONFIG_EXTRA` is merged over the generated config so a backend can
-    // be given model paths, device indices or its own knobs without the engine
-    // having to know about them. It is also how the test suite drives a backend
-    // into a specific state (an injected out-of-memory fault, for instance)
-    // without a test-only code path in the engine.
-    if let Ok(extra) = std::env::var("SR_INFER_CONFIG_EXTRA") {
-        if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&extra) {
-            if let Some(target) = config.as_object_mut() {
-                for (key, value) in fields {
-                    target.insert(key, value);
-                }
-            }
-        }
-    }
-    SessionRequest {
-        device_index,
-        model_path: None,
-        model_name: None,
-        config_json: Some(config.to_string()),
-        vram_budget_bytes: ctx.plan.vram.ai_budget_mib.saturating_mul(1024 * 1024),
-        host_memory_budget_bytes: 0,
-    }
-}
-
-fn working_request(working: &WorkingSet) -> WorkingSetRequest {
-    WorkingSetRequest {
-        batch: working.batch,
-        tile: working.vae_tile,
-        offload: working.offload.as_str().to_string(),
-        block_swap: working.block_swap,
-        precision: String::new(),
-    }
-}
-
-fn tile_for(working: &WorkingSet) -> Option<(u32, u32)> {
-    if working.vae_tile > 0 {
-        Some((working.vae_tile, working.vae_tile))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::profile::RestorationProfile;
 
     #[test]
     fn frame_rates_cross_the_boundary_as_rationals() {
@@ -1347,19 +995,6 @@ mod tests {
         );
         // A degenerate rate must still produce something FFmpeg accepts.
         assert_eq!(rational_arg(Rational::new(0, 1).unwrap()), "1");
-    }
-
-    #[test]
-    fn the_working_set_request_follows_the_ladder() {
-        let profile = RestorationProfile::safe_16gb();
-        let mut working = WorkingSet::initial(&profile.restoration);
-        let first = working_request(&working);
-        let change = working.degrade().expect("the ladder has a first rung");
-        assert!(change.contains("block swap"), "{change}");
-        let second = working_request(&working);
-        assert!(second.block_swap > first.block_swap);
-        assert_eq!(second.batch, first.batch);
-        assert!(tile_for(&working).is_some());
     }
 
     #[test]

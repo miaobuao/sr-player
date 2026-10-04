@@ -11,7 +11,6 @@
 
 use sr_core::events::{Event, JobState, Stage, StageStatus};
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::media::probe;
 use sr_core::pipeline::plan::PlanRequest;
 use sr_core::pipeline::profile::{InterpolationMethod, RestorationProfile};
@@ -169,11 +168,9 @@ fn converts_a_real_file_end_to_end_and_verifies_the_result() {
     let store = Arc::new(Store::open(&dir.path().join("jobs.sqlite3")).expect("state store"));
     let bus = EventBus::new();
     let events = bus.subscribe();
-    let engines = Arc::new(EngineRegistry::probe(Arc::clone(&ff)));
     let cancel = Arc::new(AtomicBool::new(false));
     let runner = PipelineRunner::new(
         Arc::clone(&ff),
-        engines,
         bus.clone(),
         Arc::clone(&store),
         Arc::clone(&cancel),
@@ -321,7 +318,6 @@ fn a_missing_input_fails_the_job_cleanly() {
     let events = bus.subscribe();
     let runner = PipelineRunner::new(
         Arc::clone(&ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(&ff))),
         bus,
         Arc::clone(&store),
         Arc::new(AtomicBool::new(false)),

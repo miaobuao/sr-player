@@ -9,7 +9,6 @@
 //! Skips itself when FFmpeg is unavailable.
 
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::media::classify::{classify, ClassifyOptions};
 use sr_core::media::probe;
 use sr_core::media::scene::{detect_scenes, SceneDecode, SceneOptions};
@@ -219,7 +218,6 @@ fn run_and_measure(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path, job: &str) -> (f6
     let events = bus.subscribe();
     let runner = PipelineRunner::new(
         Arc::clone(ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(ff))),
         bus.clone(),
         Arc::new(Store::open(&dir.join(format!("{job}.sqlite3"))).expect("state store")),
         Arc::new(AtomicBool::new(false)),

@@ -21,9 +21,3 @@ ash = { version = "0.38", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-# Built only so the ABI integration test has a real shared library to load.
-sr-infer-plugin-example = { path = "../sr-infer-plugin-example" }
-# The Vulkan backend is a *test* dependency: the shipped engine has no GPU API
-# dependency at all, and `tests/gpu_execution.rs` loads this one as a plugin,
-# exactly as a user would.
-sr-infer-gpu = { path = "../sr-infer-gpu" }

@@ -9,7 +9,6 @@ use sr_core::audio::{analyze, AnalyzeOptions};
 use sr_core::events::{Event, Level, StageStatus};
 use sr_core::ffmpeg::Ffmpeg;
 use sr_core::gpu;
-use sr_core::infer::EngineRegistry;
 use sr_core::media::classify::{classify, ClassifyOptions};
 use sr_core::media::probe;
 use sr_core::media::scene::{detect_scenes, SceneDecode, SceneOptions};
@@ -81,7 +80,10 @@ enum Command {
         /// Keep the intermediate WAV / scratch files.
         #[arg(long)]
         keep_intermediates: bool,
-        /// off | duplicate | minterpolate | plugin
+        /// off | rife
+        ///
+        /// `rife` is the only interpolator, and it is not built yet: asking for it
+        /// fails before any pixel moves rather than quietly running something else.
         #[arg(long)]
         interpolate: Option<String>,
         /// How the native executor stores its per-chunk checkpoints:
@@ -95,6 +97,16 @@ enum Command {
         /// Encoder quality target (CQ/CRF).
         #[arg(long)]
         quality: Option<i32>,
+        /// Enable re-grain. Any positive value switches the per-shot estimator
+        /// on, and the strength actually applied is then *measured* from each
+        /// shot rather than taken from this number. The number is used directly
+        /// only on the single-pass path, which has one filter chain for the whole
+        /// film and therefore cannot vary it.
+        ///
+        /// This is also what selects the chunked executor, so it is what makes
+        /// per-chunk resume reachable from the command line.
+        #[arg(long)]
+        regrain: Option<f32>,
     },
     /// List recent jobs from the state database.
     Jobs {
@@ -107,8 +119,8 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
-    /// Show the inference engines and GPU telemetry this machine offers.
-    Engines,
+    /// Show the AI runtime, GPU telemetry and hardware decode this machine offers.
+    Devices,
     /// List the built-in profiles.
     Profiles,
 }
@@ -150,16 +162,12 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Engines => {
+        Command::Devices => {
             let ff = Arc::new(discover_ffmpeg(cli)?);
-            let engines = EngineRegistry::probe(Arc::clone(&ff));
             println!("sr-core {VERSION}");
             println!("{}", ff.version);
             println!("GPU: {}", gpu::describe(&gpu::probe()));
-            println!("{}\n", engines.summary());
-            for (name, value) in engines.report_rows() {
-                println!("{name:<22} {value}");
-            }
+            println!("{}", sr_core::pipeline::ai_runtime_line());
             println!("\nhardware decode: {}", ff.hwaccels().join(", "));
             Ok(ExitCode::SUCCESS)
         }
@@ -299,6 +307,7 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             chunk_encoding,
             no_audio,
             quality,
+            regrain,
         } => {
             let output = match output {
                 Some(path) => path.clone(),
@@ -322,9 +331,16 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             if let Some(quality) = quality {
                 profile.output.quality = *quality;
             }
+            if let Some(strength) = regrain {
+                if !strength.is_finite() || *strength < 0.0 {
+                    return Err(sr_core::Error::Other(format!(
+                        "re-grain strength `{strength}` must be a finite value >= 0"
+                    )));
+                }
+                profile.output.regrain_strength = *strength;
+            }
 
             let ff = Arc::new(discover_ffmpeg(cli)?);
-            let engines = Arc::new(EngineRegistry::probe(Arc::clone(&ff)));
             let store = Arc::new(Store::open(&state_db)?);
             let bus = EventBus::new();
             attach_printer(&bus, cli.verbose);
@@ -338,7 +354,6 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             let cancel = Arc::new(AtomicBool::new(false));
             let runner = PipelineRunner::new(
                 ff,
-                engines,
                 bus.clone(),
                 Arc::clone(&store),
                 Arc::clone(&cancel),

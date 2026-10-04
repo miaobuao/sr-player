@@ -18,7 +18,6 @@
 //! Skips itself when FFmpeg is unavailable.
 
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::media::classify::{classify, ClassifyOptions, TemporalMode};
 use sr_core::media::probe;
 use sr_core::media::scene::{detect_scenes, SceneDecode, SceneOptions};
@@ -164,8 +163,7 @@ fn plan_for(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path) -> Fixture {
         output: dir.join("out.mkv"),
         profile,
     };
-    let engines = EngineRegistry::probe(Arc::clone(ff));
-    let plan = build_plan(ff, &engines, &manifest, &temporal, &scenes, None, &request)
+    let plan = build_plan(ff, &manifest, &temporal, &scenes, None, &request)
         .expect("build a plan");
     Fixture {
         plan,
@@ -176,7 +174,6 @@ fn plan_for(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path) -> Fixture {
 fn run_pipeline(ff: &Arc<Ffmpeg>, input: &Path, output: &Path, scratch: &Path) -> (bool, String) {
     let runner = PipelineRunner::new(
         Arc::clone(ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(ff))),
         EventBus::new(),
         Arc::new(Store::open(&scratch.join("jobs.sqlite3")).expect("state store")),
         Arc::new(AtomicBool::new(false)),

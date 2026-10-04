@@ -10,23 +10,48 @@
 //! the property being tested — that committed chunks survive and are not recomputed
 //! — because the commit happens per chunk, on disk, before the run continues.
 //!
-//! Self-contained rather than sharing helpers with `native_execution.rs`: this is a
-//! separate test binary because `SR_INFER_CALL_LOG` is a process-global and two
-//! tests setting it in one binary race.
+//! ## Why this test asks for re-grain
 //!
-//! Skips itself when FFmpeg or the example plugin is unavailable.
+//! Per-chunk resume only exists on the chunked executor, and the chunked executor is
+//! now selected by a *measured* per-shot re-grain: with `output.regrain_strength > 0`
+//! the planner measures each shot and builds one chunk per shot, which is the only
+//! thing in this build that needs a per-chunk filter chain. The old selector was the
+//! model stage, and the model stage is gone. So the profile below switches re-grain
+//! on, and the executor is asserted to be `chunked` before anything is concluded from
+//! the run; the test has nothing to say about grain itself.
+//!
+//! ## What is observed, now that the plugin call log is gone
+//!
+//! The progress signal used to be the example plugin's call log (`SR_INFER_CALL_LOG`
+//! plus `SR_INFER_PLUGIN`): it counted chunk calls from inside the inference ABI, and
+//! with that ABI deleted there is nothing left to read it. The durable record is
+//! watched instead, and it is the stronger evidence of the two:
+//!
+//! * the `chunks` table of the job's state database, which the executor commits per
+//!   chunk before it moves on — so it says what *survived*, not what was attempted;
+//! * the length and modification time of every committed chunk artifact. A chunk that
+//!   was re-encoded rewrites its file, so "not recomputed" becomes falsifiable rather
+//!   than a claim about a log line;
+//! * the plan's own `executor` field, read back from the stored plan.
+//!
+//! Skips itself when FFmpeg is unavailable.
 
+use sr_core::events::Stage;
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::pipeline::plan::PlanRequest;
-use sr_core::pipeline::profile::{InterpolationMethod, RestorationProfile};
+use sr_core::pipeline::profile::RestorationProfile;
 use sr_core::pipeline::runner::{PipelineRunner, RunnerOptions};
 use sr_core::state::Store;
 use sr_core::EventBus;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// The job id both the reference run and the interrupted run use. It is only a key
+/// into each run's own state database.
+const JOB: &str = "resume";
 
 fn ffmpeg_or_skip() -> Option<Arc<Ffmpeg>> {
     match Ffmpeg::discover() {
@@ -38,43 +63,18 @@ fn ffmpeg_or_skip() -> Option<Arc<Ffmpeg>> {
     }
 }
 
-fn example_plugin() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let name = if cfg!(windows) {
-        "sr_infer_plugin_example.dll"
-    } else if cfg!(target_os = "macos") {
-        "libsr_infer_plugin_example.dylib"
-    } else {
-        "libsr_infer_plugin_example.so"
-    };
-    // Both paths are legitimate cargo outputs, and *which one is current depends on
-    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
-    // building it as a dependency writes `deps/`. Taking the first that existed loaded
-    // a stale binary and silently invalidated a test - the injected fault was in the
-    // newer file and never ran, and the test could not tell.
-    [dir.join(name), dir.join("deps").join(name)]
-        .into_iter()
-        .filter(|path| path.exists())
-        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
-}
-
 /// Five one-second shots, so an interruption has somewhere to land that is not the
 /// first or the last chunk.
 fn build_fixture(ff: &Ffmpeg, dir: &Path) -> PathBuf {
     let input = dir.join("resume-input.mkv");
     let mut argv = args(&["-y", "-hide_banner", "-loglevel", "error"]);
-    for (index, source) in [
+    for source in [
         "testsrc2=size=320x240:rate=24",
         "mandelbrot=size=320x240:rate=24",
         "gradients=size=320x240:rate=24",
         "testsrc=size=320x240:rate=24",
         "smptebars=size=320x240:rate=24",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let _ = index;
+    ] {
         argv.extend(args(&["-t", "1", "-f", "lavfi", "-i", source]));
     }
     argv.extend(args(&[
@@ -107,18 +107,59 @@ fn frame_hashes(ff: &Ffmpeg, path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The chunk ids a plugin call log mentions, in order.
-fn chunks_called(log: &Path) -> Vec<u64> {
-    let Ok(text) = std::fs::read_to_string(log) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| {
-            let needle = "\"chunk\":";
-            let start = line.find(needle)? + needle.len();
-            line[start..].split(',').next()?.trim().parse().ok()
-        })
+/// The chunks the store says are durable, by index, with the file each one wrote.
+fn committed_chunks(store: &Store, job: &str) -> BTreeMap<u32, PathBuf> {
+    store
+        .chunks(job)
+        .expect("read the chunk table")
+        .into_iter()
+        .filter(|row| row.stage == Stage::Encode && row.status == "committed")
+        .filter_map(|row| row.artifact.map(|artifact| (row.chunk_index, artifact)))
         .collect()
+}
+
+/// Chunk index → the input frames it covers. A resume has to reproduce the plan, not
+/// merely a file of the right length: a different split would put the chunk
+/// boundaries somewhere else and the output would differ at the joins.
+fn chunk_spans(store: &Store, job: &str) -> BTreeMap<u32, (Option<i64>, Option<i64>)> {
+    store
+        .chunks(job)
+        .expect("read the chunk table")
+        .into_iter()
+        .filter(|row| row.stage == Stage::Encode && row.status == "committed")
+        .map(|row| (row.chunk_index, (row.start_frame, row.end_frame)))
+        .collect()
+}
+
+/// The executor the stored plan names. Read back from the plan rather than assumed,
+/// because everything this test concludes depends on the chunked path having run.
+fn executor_of(store: &Store, job: &str) -> String {
+    let plan_json = store
+        .job(job)
+        .expect("read the job")
+        .and_then(|row| row.plan_json)
+        .unwrap_or_else(|| panic!("job {job} has no plan"));
+    let plan: serde_json::Value = serde_json::from_str(&plan_json).expect("the plan is JSON");
+    plan.pointer("/video/executor")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<absent>")
+        .to_string()
+}
+
+/// Length and modification time: the two things a re-encode cannot leave alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Artifact {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn artifact(path: &Path) -> Artifact {
+    let meta = std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("chunk artifact {} is unreadable: {err}", path.display()));
+    Artifact {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    }
 }
 
 struct Job<'a> {
@@ -129,19 +170,22 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
+    fn store_path(&self) -> PathBuf {
+        self.dir.join("resume.sqlite3")
+    }
+
     fn run(&self, output: &Path, cancel: Arc<AtomicBool>, resume: bool) -> (bool, String) {
         let runner = PipelineRunner::new(
             Arc::clone(self.ff),
-            Arc::new(EngineRegistry::probe(Arc::clone(self.ff))),
             EventBus::new(),
-            Arc::new(Store::open(&self.dir.join("resume.sqlite3")).expect("state store")),
+            Arc::new(Store::open(&self.store_path()).expect("state store")),
             cancel,
             self.dir.join("scratch"),
         );
         let mut profile = RestorationProfile::deterministic();
-        profile.interpolation.method = InterpolationMethod::Plugin;
-        profile.interpolation.multiplier = 2;
-        profile.restoration.enabled = false;
+        // Not about grain: a measured per-shot re-grain is what selects the chunked
+        // executor, and per-chunk resume exists only there.
+        profile.output.regrain_strength = 8.0;
         profile.restoration.max_upscale = 1.0;
         profile.audio.enabled = false;
         profile.output.prefer_hardware = false;
@@ -169,63 +213,67 @@ fn an_interrupted_job_resumes_without_recomputing_committed_chunks() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
     };
-    let Some(plugin) = example_plugin() else {
-        eprintln!("SKIPPED: the example inference plugin was not built");
-        return;
-    };
     let dir = tempfile::tempdir().expect("temp dir");
     let input = build_fixture(&ff, dir.path());
-    std::env::set_var("SR_INFER_PLUGIN", &plugin);
 
     // ---- the reference run: uninterrupted, in its own job directory --------
     let reference_dir = dir.path().join("reference");
     std::fs::create_dir_all(&reference_dir).expect("reference dir");
-    let reference_log = dir.path().join("reference.log");
-    std::env::set_var("SR_INFER_CALL_LOG", &reference_log);
     let reference = Job {
         ff: &ff,
         input: &input,
         dir: &reference_dir,
-        job_id: "resume",
+        job_id: JOB,
     };
     let reference_output = reference_dir.join("out.mkv");
     let (ok, message) = reference.run(&reference_output, Arc::new(AtomicBool::new(false)), true);
     assert!(ok, "the reference run failed: {message}");
     let reference_hashes = frame_hashes(&ff, &reference_output);
-    let reference_chunks: BTreeSet<u64> = chunks_called(&reference_log).into_iter().collect();
+    let reference_store = Store::open(&reference.store_path()).expect("reference store");
+    assert_eq!(
+        executor_of(&reference_store, JOB),
+        "chunked",
+        "the fixture must run through the chunked executor, or there is no per-chunk \
+         resume for this test to interrupt"
+    );
+    let reference_chunks = committed_chunks(&reference_store, JOB);
     assert!(
         reference_chunks.len() >= 3,
         "the fixture must produce several chunks for an interruption to mean \
          anything, got {:?}",
-        reference_chunks
+        reference_chunks.keys().collect::<Vec<_>>()
     );
+    let reference_spans = chunk_spans(&reference_store, JOB);
 
     // ---- the interrupted run, in the job directory the resume will use -----
     let job_dir = dir.path().join("job");
     std::fs::create_dir_all(&job_dir).expect("job dir");
-    let interrupted_log = dir.path().join("interrupted.log");
-    std::env::set_var("SR_INFER_CALL_LOG", &interrupted_log);
     let job = Job {
         ff: &ff,
         input: &input,
         dir: &job_dir,
-        job_id: "resume",
+        job_id: JOB,
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
     let watcher = {
         let cancel = Arc::clone(&cancel);
-        let log = interrupted_log.clone();
+        let state = job.store_path();
         std::thread::spawn(move || {
-            // Cancel once two chunks have been worked on: far enough in that the
-            // first is committed, early enough that the job cannot finish.
-            for _ in 0..4_000 {
-                let distinct: BTreeSet<u64> = chunks_called(&log).into_iter().collect();
-                if distinct.len() >= 2 {
+            // The store is opened once and reused: the database is in WAL mode, so a
+            // reader neither blocks the writer nor is blocked by it, and a poll every
+            // couple of milliseconds costs nothing.
+            let Ok(store) = Store::open(&state) else {
+                return false;
+            };
+            // Cancel once two chunks are committed: far enough in that the first is
+            // durable, early enough that the job cannot finish.
+            for _ in 0..6_000 {
+                if committed_chunks(&store, JOB).len() >= 2 {
                     cancel.store(true, Ordering::Relaxed);
                     return true;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(2));
             }
             false
         })
@@ -239,62 +287,74 @@ fn an_interrupted_job_resumes_without_recomputing_committed_chunks() {
     );
     assert!(
         cancelled_in_time,
-        "the watcher never saw two chunks; the test cannot conclude anything"
+        "the watcher never saw two committed chunks; the test cannot conclude anything"
     );
 
-    // What the job actually committed before it was stopped, from the store rather
-    // than from the log: the log says what was *attempted*, the table says what
-    // survived, and resume follows the table.
-    let store = Store::open(&job_dir.join("resume.sqlite3")).expect("reopen the store");
-    let rows = store.chunks("resume").expect("read the chunks");
-    for row in &rows {
-        eprintln!(
-            "  chunk row: stage {:?} index {} status {} artifact {:?}",
-            row.stage, row.chunk_index, row.status, row.artifact
-        );
+    // What the job actually committed before it was stopped. This is the table, not a
+    // log: the commit happens before the run continues, so a row here means the file
+    // it names was complete on disk when the process stopped.
+    let store = Store::open(&job.store_path()).expect("reopen the store");
+    let committed = committed_chunks(&store, JOB);
+    for (index, path) in &committed {
+        eprintln!("  chunk {index:04} committed: {}", path.display());
     }
-    let committed: BTreeSet<u64> = rows
-        .iter()
-        .filter(|chunk| chunk.status == "committed")
-        .map(|chunk| chunk.chunk_index as u64)
-        .collect();
-    eprintln!(
-        "interrupted after {} chunk(s) committed: {committed:?}",
-        committed.len()
-    );
     assert!(
         !committed.is_empty(),
         "an interrupted run must leave its finished chunks behind, or resume has \
          nothing to resume from"
     );
+    let before: BTreeMap<u32, Artifact> = committed
+        .iter()
+        .map(|(index, path)| (*index, artifact(path)))
+        .collect();
 
     // ---- the resumed run ---------------------------------------------------
-    let resumed_log = dir.path().join("resumed.log");
-    std::env::set_var("SR_INFER_CALL_LOG", &resumed_log);
     let resumed_output = job_dir.join("out.mkv");
     let (ok, message) = job.run(&resumed_output, Arc::new(AtomicBool::new(false)), true);
     assert!(ok, "the resumed run failed: {message}");
 
-    let resumed_calls: Vec<u64> = chunks_called(&resumed_log);
-    let resumed_chunks: BTreeSet<u64> = resumed_calls.iter().copied().collect();
+    let after = committed_chunks(&store, JOB);
     eprintln!(
-        "reference chunks {reference_chunks:?}, committed before the interruption \
-         {committed:?}, recomputed after {resumed_chunks:?}"
+        "reference chunks {:?}, committed before the interruption {:?}, committed \
+         after the resumed run {:?}",
+        reference_chunks.keys().collect::<Vec<_>>(),
+        committed.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
     );
 
-    // The heart of it: nothing that was already committed may be computed again.
-    let repeated: Vec<u64> = committed.intersection(&resumed_chunks).copied().collect();
-    assert!(
-        repeated.is_empty(),
-        "the resumed run recomputed chunks {repeated:?}, which were already \
-         committed; resume is not resuming"
-    );
-    // And every chunk must have been done exactly once across the two runs.
-    let done: BTreeSet<u64> = committed.union(&resumed_chunks).copied().collect();
+    // The heart of it: nothing that was already committed may be computed again. A
+    // re-encoded chunk rewrites its artifact, so the file that was durable before the
+    // interruption must be byte-length-identical and untouched afterwards.
+    for (index, was) in &before {
+        let path = after.get(index).unwrap_or_else(|| {
+            panic!("chunk {index} was committed before the interruption and is missing from the table now")
+        });
+        assert_eq!(
+            path,
+            committed.get(index).expect("same index"),
+            "chunk {index} must still name the artifact it committed"
+        );
+        assert_eq!(
+            artifact(path),
+            *was,
+            "chunk {index} was recomputed by the resumed run ({} changed), which was \
+             already committed before the interruption; resume is not resuming",
+            path.display()
+        );
+    }
+
+    // And the resumed run must have produced the chunks it had not reached: the whole
+    // plan, with the same boundaries, or the film would join differently.
     assert_eq!(
-        done, reference_chunks,
+        after.keys().copied().collect::<BTreeSet<u32>>(),
+        reference_chunks.keys().copied().collect::<BTreeSet<u32>>(),
         "the interrupted and resumed runs together must cover exactly the chunks a \
          single run covers"
+    );
+    assert_eq!(
+        chunk_spans(&store, JOB),
+        reference_spans,
+        "the resumed run must split the film where the reference run did"
     );
 
     // The film must be the same film: a resume that produces different frames is

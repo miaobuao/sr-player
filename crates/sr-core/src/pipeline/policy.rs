@@ -1,37 +1,20 @@
-//! VRAM budgeting and the OOM degrade ladder.
+//! VRAM budgeting and the out-of-memory degrade ladder.
 //!
 //! Two rules make unattended operation possible:
 //!
 //! 1. **Budget from what is free, not from what is installed.**
 //!    `min(13 GiB, free - 2.5 GiB)` — because the user's browser, the desktop
-//!    compositor and the CUDA context are all sharing the same 16 GB.
-//! 2. **On OOM, degrade in a fixed order and retry the same shot.** Raising
-//!    block swap costs throughput; lowering the temporal batch costs temporal
-//!    consistency; shrinking the VAE tile costs quality. So the ladder spends
-//!    throughput first and quality last, and it never produces a batch that the
-//!    model cannot accept.
+//!    compositor and the driver are all sharing the same 16 GB.
+//! 2. **On OOM, degrade in a fixed order and retry the same chunk.** For the two
+//!    networks this project runs there is exactly one knob that reduces peak
+//!    memory: the restoration tile edge. RIFE already works a pair of frames at a
+//!    time and needs no budget of its own, so the ladder is the tile ladder and
+//!    nothing else — a short ladder that is honest about what it can and cannot
+//!    buy, rather than a long one whose lower rungs do nothing.
 
 use crate::gpu::{self, GpuInfo};
-use crate::pipeline::profile::{RestorationSettings, VALID_TEMPORAL_BATCHES};
+use crate::pipeline::profile::{RestorationSettings, TILE_LADDER};
 use serde::{Deserialize, Serialize};
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OffloadMode {
-    /// Everything resident.
-    None,
-    /// Weights streamed from pinned host memory.
-    Cpu,
-}
-
-impl OffloadMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            OffloadMode::None => "none",
-            OffloadMode::Cpu => "cpu",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VramBudget {
@@ -70,38 +53,15 @@ impl VramBudget {
 }
 
 /// `min(hard ceiling, free - reserve)`.
-pub fn plan_vram(hard_ceiling_mib: u64, reserve_mib: u64, gpus: &[GpuInfo]) -> VramBudget {
-    plan_vram_with(hard_ceiling_mib, reserve_mib, gpus, None)
-}
-
-/// The same decision, but preferring the number the *model backend* reports.
 ///
-/// The engine's Vulkan probe and the backend's device list are different views of
-/// the same card, and the backend is the one that will actually allocate. When it
-/// can see a budget, that budget is the truth; the probe is a fallback for the
-/// case where no model is installed at all.
-pub fn plan_vram_with(
-    hard_ceiling_mib: u64,
-    reserve_mib: u64,
-    gpus: &[GpuInfo],
-    backend_free_mib: Option<u64>,
-) -> VramBudget {
-    let probe_free = gpu::free_mib(gpus);
-    // The backend's number wins when there is one, even if it is *larger*: it is
-    // the process that has to make the allocation succeed, and it knows about the
-    // memory it is already holding.
-    let free = backend_free_mib.or(probe_free);
+/// The native runtime also knows a free-memory figure of its own, and in time
+/// that figure should take precedence because the runtime is what allocates. It
+/// is not consulted yet: the number would come from the same Vulkan heap the
+/// device probe already reads, so preferring it today would add a second source
+/// of truth without adding information.
+pub fn plan_vram(hard_ceiling_mib: u64, reserve_mib: u64, gpus: &[GpuInfo]) -> VramBudget {
+    let free = gpu::free_mib(gpus);
     let mut notes = Vec::new();
-    if let (Some(backend), Some(probe)) = (backend_free_mib, probe_free) {
-        if backend != probe {
-            notes.push(format!(
-                "the model backend reports {:.1} GiB available while the device probe sees {:.1} \
-                 GiB: budgeting against the backend, because it is the one that allocates",
-                backend as f64 / 1024.0,
-                probe as f64 / 1024.0
-            ));
-        }
-    }
     let mut budget = hard_ceiling_mib;
     if let Some(free) = free {
         let available = free.saturating_sub(reserve_mib);
@@ -145,12 +105,11 @@ pub fn plan_vram_with(
 /// Current working point of the restore stage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkingSet {
-    pub block_swap: u32,
-    pub block_swap_max: u32,
-    pub vae_tile: u32,
-    pub vae_tile_min: u32,
-    pub offload: OffloadMode,
-    pub batch: u32,
+    /// Tile edge in pixels. `0` means the runtime chooses.
+    pub tile: u32,
+    pub tile_min: u32,
+    /// Model scale, carried so the memory estimate knows the activation shape.
+    pub scale: u32,
     /// How many times we have degraded for this job.
     pub rung: u32,
 }
@@ -158,86 +117,89 @@ pub struct WorkingSet {
 impl WorkingSet {
     pub fn initial(settings: &RestorationSettings) -> Self {
         WorkingSet {
-            block_swap: settings.block_swap,
-            block_swap_max: settings.block_swap_max,
-            vae_tile: settings.vae_tile,
-            vae_tile_min: settings.vae_tile_min,
-            offload: if settings.offload.eq_ignore_ascii_case("cpu") {
-                OffloadMode::Cpu
-            } else {
-                OffloadMode::None
-            },
-            batch: settings.preferred_batch,
+            tile: settings.tile,
+            tile_min: settings.tile_min,
+            scale: settings.scale.max(1),
             rung: 0,
         }
     }
 
     pub fn describe(&self) -> String {
-        format!(
-            "batch {}, block swap {}/{}, vae tile {}, offload {}",
-            self.batch,
-            self.block_swap,
-            self.block_swap_max,
-            self.vae_tile,
-            self.offload.as_str()
-        )
+        if self.tile == 0 {
+            "tile auto".to_string()
+        } else {
+            format!("tile {}", self.tile)
+        }
+    }
+
+    /// The tile edge to hand the runtime, or `None` for "the runtime decides".
+    ///
+    /// This is the number that crosses the C ABI; `0` there means automatic.
+    pub fn tile_arg(&self) -> u32 {
+        self.tile
     }
 
     /// Estimated resident working set, purely for the "does it fit" conversation.
+    ///
+    /// The model is 67 MB of weights; everything else is activation. A tiled
+    /// x4 network holds roughly `tile^2 * scale^2 * 3` outputs, and each of those
+    /// costs several bytes across the intermediate feature maps — the factor of
+    /// 48 below is the sum of that, and it is an estimate to start a
+    /// conversation, not a measurement. It is only ever used to print a number
+    /// and to decide when to warn.
     pub fn estimated_mib(&self) -> u64 {
-        // Weights at FP8 for a 3B model, plus activations that scale with the
-        // temporal batch, plus the VAE tile, minus what block swap streams out.
-        let weights = 3_400u64;
-        let activations = 900 * self.batch as u64;
-        let vae = (self.vae_tile as u64 * self.vae_tile as u64) / 256;
-        let streamed = (self.block_swap as u64) * 90;
-        weights + activations + vae + 800 - streamed.min(2_000)
+        // With no tile chosen yet, assume the largest the ladder would pick.
+        let tile = if self.tile == 0 {
+            TILE_LADDER[0]
+        } else {
+            self.tile
+        } as u64;
+        let weights = 67;
+        let scale = self.scale as u64;
+        let activations = tile * tile * scale * scale * 3 * 48 / 1_048_576;
+        // Input, output and the encoder's hand-off copy of a 4K frame.
+        let frame_io = 3 * (3840u64 * 2160 * 3 / 1_048_576);
+        weights + activations + frame_io
     }
 
     /// Next degradation step. `None` when the ladder is exhausted.
     ///
-    /// Order is deliberate: throughput first (block swap), then quality (VAE
-    /// tile), then the temporal batch — and the batch only ever takes values the
-    /// model accepts.
+    /// The only rung is a smaller tile, and the ladder is strictly descending so
+    /// repeated failures cannot loop on the same value.
     pub fn degrade(&mut self) -> Option<String> {
         self.rung += 1;
-        if self.block_swap < self.block_swap_max {
-            let next = (self.block_swap + 4).min(self.block_swap_max);
-            let message = format!(
-                "increasing block swap {} -> {} (a little slower, same result)",
-                self.block_swap, next
-            );
-            self.block_swap = next;
+        if self.tile == 0 {
+            // Automatic failed: start at the top of the ladder. The top rung is
+            // not a reduction, it is the first *explicit* choice, and saying so
+            // keeps the log readable when `auto` was the thing that did not fit.
+            let next = TILE_LADDER
+                .iter()
+                .copied()
+                .find(|tile| *tile >= self.tile_min)
+                .unwrap_or(self.tile_min);
+            let message = format!("tile auto -> {next} (explicit tile after an out-of-memory failure)");
+            self.tile = next;
             return Some(message);
         }
-        if self.vae_tile > self.vae_tile_min {
-            let next = (self.vae_tile / 2).max(self.vae_tile_min);
-            let message = format!(
-                "reducing VAE tile {} -> {} (watch for tile seams)",
-                self.vae_tile, next
-            );
-            self.vae_tile = next;
-            return Some(message);
-        }
-        if self.offload == OffloadMode::None {
-            self.offload = OffloadMode::Cpu;
-            return Some("enabling CPU offload with pinned memory".to_string());
-        }
-        let valid: Vec<u32> = VALID_TEMPORAL_BATCHES
+        let next = TILE_LADDER
             .iter()
             .copied()
-            .filter(|b| *b < self.batch)
-            .collect();
-        if let Some(next) = valid.last().copied() {
-            let message = format!(
-                "reducing temporal batch {} -> {} (valid 4n+1 value; temporal consistency suffers)",
-                self.batch, next
-            );
-            self.batch = next;
-            return Some(message);
+            .filter(|tile| *tile < self.tile && *tile >= self.tile_min)
+            .max();
+        match next {
+            Some(next) => {
+                let message = format!(
+                    "reducing tile {} -> {} (smaller activation; watch for tile seams)",
+                    self.tile, next
+                );
+                self.tile = next;
+                Some(message)
+            }
+            None => {
+                self.rung -= 1;
+                None
+            }
         }
-        self.rung -= 1;
-        None
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -300,70 +262,40 @@ mod tests {
     }
 
     #[test]
-    fn degrade_ladder_spends_throughput_before_quality() {
+    fn the_ladder_starts_at_auto_and_only_ever_shrinks() {
         let profile = RestorationProfile::safe_16gb();
         let mut set = WorkingSet::initial(&profile.restoration);
-        assert_eq!(set.batch, 5);
-        // The default profile already offloads, so the ladder runs
-        // block swap -> VAE tile -> temporal batch.
-        assert_eq!(set.offload, OffloadMode::Cpu);
+        assert_eq!(set.tile, 0, "the profile asks the runtime to choose");
 
-        let first = set.degrade().unwrap();
-        assert!(first.contains("block swap"), "got: {first}");
-        assert_eq!(set.batch, 5, "the batch must not drop first");
+        let first = set.degrade().expect("auto is the first rung");
+        assert!(first.contains("auto -> 512"), "got: {first}");
+        assert_eq!(set.tile, 512);
 
-        set.degrade();
-        assert_eq!(set.block_swap, set.block_swap_max);
-
-        let third = set.degrade().unwrap();
-        assert!(third.contains("VAE tile"), "got: {third}");
-        assert_eq!(set.batch, 5, "quality is spent after throughput, not before");
-
-        let fourth = set.degrade().unwrap();
-        assert!(fourth.contains("temporal batch"), "got: {fourth}");
-        assert_eq!(set.batch, 1);
-        assert_eq!((set.batch - 1) % 4, 0);
-        assert!(set.degrade().is_none(), "the ladder must end");
-    }
-
-    #[test]
-    fn enabling_offload_is_a_rung_when_it_was_off() {
-        let mut settings = RestorationProfile::safe_16gb().restoration;
-        settings.offload = "none".into();
-        let mut set = WorkingSet::initial(&settings);
-        assert_eq!(set.offload, OffloadMode::None);
-        // spend block swap, then the VAE tile, and only then reach for offload
-        let mut changes = Vec::new();
+        let mut seen = vec![set.tile];
         while let Some(change) = set.degrade() {
-            changes.push(change);
+            assert!(change.contains("reducing tile"), "got: {change}");
+            seen.push(set.tile);
         }
-        let offload_rung = changes
-            .iter()
-            .position(|c| c.contains("offload"))
-            .expect("offload must be on the ladder");
-        let tile_rung = changes
-            .iter()
-            .position(|c| c.contains("VAE tile"))
-            .expect("VAE tile must be on the ladder");
-        let batch_rung = changes
-            .iter()
-            .position(|c| c.contains("temporal batch"))
-            .expect("batch must be on the ladder");
-        assert!(tile_rung < offload_rung && offload_rung < batch_rung);
+        assert_eq!(seen, vec![512, 384, 256, 192, 128]);
+        assert!(
+            seen.windows(2).all(|w| w[0] > w[1]),
+            "the ladder must be strictly descending: {seen:?}"
+        );
+        assert!(set.is_exhausted());
     }
 
     #[test]
-    fn the_ladder_never_produces_batch_three() {
-        let profile = RestorationProfile::safe_16gb();
-        let mut set = WorkingSet::initial(&profile.restoration);
-        let mut seen = vec![set.batch];
-        while let Some(_) = set.degrade() {
-            seen.push(set.batch);
+    fn an_explicit_tile_below_the_cap_still_walks_down_to_the_floor() {
+        let mut settings = RestorationProfile::safe_16gb().restoration;
+        settings.tile = 384;
+        settings.tile_min = 192;
+        let mut set = WorkingSet::initial(&settings);
+        let mut seen = vec![set.tile];
+        while set.degrade().is_some() {
+            seen.push(set.tile);
         }
-        assert!(!seen.contains(&3), "batch 3 is not a valid 4n+1 value: {seen:?}");
-        for batch in &seen {
-            assert_eq!((batch - 1) % 4, 0, "{batch} is not 4n+1");
-        }
+        assert_eq!(seen, vec![384, 256, 192], "the floor is tile_min, not 128");
+        assert!(set.is_exhausted());
     }
 
     #[test]
@@ -376,23 +308,41 @@ mod tests {
             assert!(steps < 20, "the ladder must terminate");
         }
         assert!(set.is_exhausted());
-        assert_eq!(set.batch, 1);
-        assert_eq!(set.vae_tile, set.vae_tile_min);
-        assert_eq!(set.offload, OffloadMode::Cpu);
+        assert_eq!(set.tile, set.tile_min);
     }
 
     #[test]
-    fn working_set_estimate_falls_as_we_degrade() {
+    fn working_set_estimate_never_rises_as_the_ladder_descends() {
         let profile = RestorationProfile::safe_16gb();
         let mut set = WorkingSet::initial(&profile.restoration);
-        let initial = set.estimated_mib();
-        set.degrade();
-        set.degrade();
-        set.degrade();
+        let mut estimates = vec![set.estimated_mib()];
+        while set.degrade().is_some() {
+            estimates.push(set.estimated_mib());
+        }
+        assert_eq!(estimates.len(), 6, "auto plus five rungs: {estimates:?}");
         assert!(
-            set.estimated_mib() < initial,
-            "degrading must reduce the estimated working set"
+            estimates.windows(2).all(|w| w[1] <= w[0]),
+            "the estimate must never rise while degrading: {estimates:?}"
         );
-        assert!(set.describe().contains("block swap"));
+        // The first rung only makes `auto` explicit, and the estimate already
+        // assumed `auto` would pick the same 512 tile, so that one step is flat by
+        // construction rather than by accident. Every rung below it must really
+        // reduce the working set, or the ladder is not buying anything.
+        assert_eq!(estimates[0], estimates[1], "auto -> 512 is not a reduction");
+        assert!(
+            estimates[2..].windows(2).all(|w| w[1] < w[0]),
+            "every rung below the first must strictly reduce the estimate: {estimates:?}"
+        );
+        assert!(estimates.last().unwrap() < estimates.first().unwrap());
+        assert!(set.describe().contains("tile 128"));
+        assert_eq!(set.tile_arg(), 128);
+    }
+
+    #[test]
+    fn an_untiled_working_set_is_reported_as_automatic() {
+        let profile = RestorationProfile::safe_16gb();
+        let set = WorkingSet::initial(&profile.restoration);
+        assert_eq!(set.tile_arg(), 0, "0 is the runtime's own default");
+        assert_eq!(set.describe(), "tile auto");
     }
 }

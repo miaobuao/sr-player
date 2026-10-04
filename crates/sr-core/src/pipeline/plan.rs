@@ -6,20 +6,18 @@
 //! left completely alone. "Zero tuning" only works if the reasoning is visible.
 
 use crate::audio::loudness::AudioAnalysis;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ffmpeg::{EncoderPreference, Ffmpeg, SelectedAudioEncoder, SelectedVideoEncoder, VideoCodec};
-use crate::infer::{EngineKind, EngineRegistry, InferenceEngine, InferenceTask};
 use crate::media::classify::{TemporalMode, TemporalReport};
 use crate::media::manifest::{MediaManifest, PreservationInventory};
 use crate::media::scene::SceneReport;
-use crate::pipeline::policy::{plan_vram_with, VramBudget, WorkingSet};
+use crate::pipeline::policy::{plan_vram, VramBudget, WorkingSet};
 use crate::pipeline::profile::{
-    InterpolationMethod, LoudnessTarget, OutputSettings, RestorationProfile,
+    InterpolationMethod, LoudnessTarget, OutputSettings, RestorationProfile, RestorationSettings,
 };
 use crate::time::{Rational, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,7 +42,6 @@ pub struct InterpolationPlan {
     pub source_fps: Rational,
     pub target_fps: Rational,
     pub multiplier: u32,
-    pub engine: Option<String>,
     /// Always true in this build: cuts are never crossed.
     pub scene_cuts_respected: bool,
     pub note: String,
@@ -52,58 +49,32 @@ pub struct InterpolationPlan {
 
 /// Who turns input frames into output frames.
 ///
-/// This is the field that keeps the engine honest: a plan that says
-/// [`VideoExecutor::NativeInference`] must be executed by pushing frames through
-/// a model session, and a plan that says [`VideoExecutor::FfmpegSinglePass`] must
-/// not claim a model ran. Before this existed, a plan could resolve to
-/// `InterpolationMethod::Plugin` and then be executed by `minterpolate`, which
-/// meant the log said "model interpolation" while FFmpeg did something else.
+/// This field exists to keep the log honest. [`VideoExecutor::FfmpegSinglePass`]
+/// means one FFmpeg process with one filter chain; [`VideoExecutor::Chunked`]
+/// means this crate decodes, hands each chunk to its own encoder with its own
+/// per-shot filter chain, and concatenates the results. A plan may only claim the
+/// second when something in it genuinely needs per-chunk control — today that is
+/// per-shot re-grain, and later it is the model stage, which cannot be expressed
+/// as an FFmpeg filter at all.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum VideoExecutor {
     /// One FFmpeg pass with a filter chain. Deterministic; no model involved.
     FfmpegSinglePass,
-    /// The engine decodes frames, pushes them through a model session, and
-    /// encodes the result, shot by shot.
-    NativeInference,
+    /// Decode, per-chunk encode with a per-shot chain, concatenate.
+    Chunked,
 }
 
 impl VideoExecutor {
+    /// The textual form. `kebab-case` above is not decoration: this value is both
+    /// stored in the plan and printed, and two spellings for one value is how a
+    /// log line and a stored plan quietly stop agreeing. `the_text_form_matches_
+    /// what_serde_writes` holds the two together.
     pub fn as_str(self) -> &'static str {
         match self {
             VideoExecutor::FfmpegSinglePass => "ffmpeg-single-pass",
-            VideoExecutor::NativeInference => "native-inference",
+            VideoExecutor::Chunked => "chunked",
         }
-    }
-}
-
-/// What the model session will actually do, resolved before any pixel moves.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InferencePlan {
-    pub engine_id: String,
-    /// `"restore"`, `"interpolate"`.
-    pub tasks: Vec<String>,
-    /// Frames handed to the model per call.
-    pub temporal_window: u32,
-    /// Frames per restore call.
-    pub max_batch: u32,
-    /// Geometry the model sees: square pixels at source resolution.
-    pub width: u32,
-    pub height: u32,
-    /// Geometry change the model applies, 1.0 = unchanged.
-    pub model_upscale: f64,
-    pub precision: Vec<String>,
-    pub model: String,
-    /// The backend accepts a smaller working set after an out-of-memory failure.
-    pub can_reconfigure: bool,
-    /// Restoration strength handed to the model.
-    pub restore_strength: f32,
-    pub note: String,
-}
-
-impl InferencePlan {
-    pub fn describes(&self, task: &str) -> bool {
-        self.tasks.iter().any(|t| t == task)
     }
 }
 
@@ -122,8 +93,10 @@ pub struct VideoPlan {
     pub interpolation: InterpolationPlan,
     /// Who executes the video work, and therefore what the log may claim.
     pub executor: VideoExecutor,
-    /// Present exactly when `executor` is [`VideoExecutor::NativeInference`].
-    pub inference: Option<InferencePlan>,
+    /// The restoration settings this plan resolved. Present on every plan: an
+    /// executor row that cannot say whether restoration was asked for cannot be
+    /// checked against what actually ran.
+    pub restoration: RestorationSettings,
     pub regrain_strength: f32,
     /// Per-shot re-grain strength, indexed by shot.
     ///
@@ -161,19 +134,19 @@ impl VideoPlan {
         self.encoder.input_args.clone()
     }
 
-    /// True when the plan's video work must go through a model session.
-    pub fn uses_model(&self) -> bool {
-        self.executor == VideoExecutor::NativeInference
+    /// True when the plan's video work must go through the chunked executor.
+    pub fn is_chunked(&self) -> bool {
+        self.executor == VideoExecutor::Chunked
     }
 
-    /// Frame rate of the raw frames the native executor pushes around.
+    /// Frame rate of the raw frames the chunked executor pushes around.
     ///
-    /// With a model interpolator the pipe already carries the target rate,
-    /// because the model produces the extra frames. Without one the pipe carries
-    /// the decoded rate and any frame-rate change happens in the post chain — so
-    /// declaring the target rate here would silently stretch the output.
+    /// With RIFE the pipe already carries the target rate, because the model
+    /// produces the extra frames. Without it the pipe carries the decoded rate and
+    /// any frame-rate change happens in the post chain — so declaring the target
+    /// rate here would silently stretch the output.
     pub fn pipe_fps(&self) -> Rational {
-        if self.interpolation.enabled && self.interpolation.method == InterpolationMethod::Plugin {
+        if self.interpolation.enabled && self.interpolation.method == InterpolationMethod::Rife {
             self.interpolation.target_fps
         } else {
             self.cadence.fps
@@ -327,23 +300,19 @@ impl ConversionPlan {
             ("cadence".into(), self.video.temporal_note.clone()),
             (
                 "executor".into(),
-                match (&self.video.executor, &self.video.inference) {
-                    (VideoExecutor::NativeInference, Some(inference)) => format!(
-                        "native inference · {} · {} · window {} · model {}",
-                        inference.engine_id,
-                        if inference.tasks.is_empty() {
-                            "no task".to_string()
+                match self.video.executor {
+                    VideoExecutor::Chunked => format!(
+                        "chunked · per-shot filter chain over {} measured shot(s) · restore {}",
+                        self.video.regrain_per_shot.len(),
+                        if self.video.restoration.enabled {
+                            self.video.restoration.model.clone()
                         } else {
-                            inference.tasks.join(" + ")
-                        },
-                        inference.temporal_window,
-                        if inference.model.is_empty() {
-                            "unnamed".to_string()
-                        } else {
-                            inference.model.clone()
+                            "off".to_string()
                         }
                     ),
-                    _ => "FFmpeg single pass (no model session)".to_string(),
+                    VideoExecutor::FfmpegSinglePass => {
+                        "FFmpeg single pass (one filter chain, no model)".to_string()
+                    }
                 },
             ),
             (
@@ -521,7 +490,7 @@ pub fn cadence_for(
         .primary_video()
         .and_then(|v| v.fps())
         .ok_or_else(|| {
-            crate::error::Error::Unsupported("the video frame rate is unknown".into())
+            Error::Unsupported("the video frame rate is unknown".into())
         })?;
     Ok(CadencePlan::plan(
         temporal.mode,
@@ -566,13 +535,13 @@ fn encoder_tail(video: &VideoPlan) -> Vec<String> {
 }
 
 /// Builds the `-vf` chain for the single-pass FFmpeg executor. Order matters and
-/// is fixed: cadence, geometry, interpolation, grain, encoder upload.
+/// is fixed: deinterlace, geometry, grain, encoder upload.
 ///
-/// A plan whose interpolation is handled by a model never reaches this function
-/// with `InterpolationMethod::Plugin`: that combination is resolved into
-/// [`VideoExecutor::NativeInference`] instead. If it does arrive here anyway, no
-/// interpolation filter is emitted at all — quietly substituting `minterpolate`
-/// is exactly the failure this build removed.
+/// No interpolation filter appears here, and that is deliberate. The only
+/// interpolation this product performs is RIFE, which is not an FFmpeg filter, so
+/// a plan that asks for it is not executed by this path at all. The previous
+/// build emitted `minterpolate` here when a model was unavailable, which made a
+/// request for RIFE silently become a request for a different algorithm.
 pub fn build_filter_chain(video: &VideoPlan, source_square: (u32, u32)) -> String {
     let mut filters: Vec<String> = Vec::new();
 
@@ -580,51 +549,17 @@ pub fn build_filter_chain(video: &VideoPlan, source_square: (u32, u32)) -> Strin
         filters.push(deinterlace.clone());
     }
     filters.extend(geometry_filters(video, source_square));
-
-    let interpolation = &video.interpolation;
-    if interpolation.enabled && interpolation.multiplier > 1 {
-        let fps = format!("{:.6}", interpolation.target_fps.to_f64());
-        match interpolation.method {
-            InterpolationMethod::Duplicate => filters.push(format!("framerate=fps={fps}")),
-            InterpolationMethod::Minterpolate => {
-                // `scd=fdiff` keeps the interpolator from crossing a cut, which
-                // is the one artefact that is impossible to miss. It is FFmpeg's
-                // own detector, not ours, which is why this engine is never used
-                // to satisfy a request for model interpolation.
-                filters.push(format!(
-                    "minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
-                ));
-            }
-            // Unreachable through `build_plan`; see the doc comment.
-            InterpolationMethod::Plugin | InterpolationMethod::Off => {}
-        }
-    }
-
     filters.extend(regrain_filter(video));
     filters.extend(encoder_tail(video));
     filters.join(",")
 }
 
-/// The chain applied to frames *after* a model session produced them.
+/// The chain applied to frames after the chunked path produced them.
 ///
-/// The model is not an FFmpeg filter, so it cannot appear here. What is left is
-/// the deterministic tail: an optional frame-rate change the model did not make,
-/// the final resize (Lanczos, because no model invented the pixels at that size),
-/// re-grain and the encoder upload.
+/// The post-model chain: the final resize (Lanczos, because the pixels at that
+/// size were not invented by a model), re-grain and the encoder upload.
 pub fn build_post_chain(video: &VideoPlan, model_output: (u32, u32)) -> String {
     let mut filters: Vec<String> = Vec::new();
-    let interpolation = &video.interpolation;
-    if interpolation.enabled
-        && interpolation.multiplier > 1
-        && interpolation.method != InterpolationMethod::Plugin
-    {
-        // The model did not synthesise these frames, so FFmpeg has to: this is
-        // frame duplication, and it is labelled as such in the plan.
-        filters.push(format!(
-            "framerate=fps={:.6}",
-            interpolation.target_fps.to_f64()
-        ));
-    }
     if (video.target_width, video.target_height) != model_output {
         filters.push(format!(
             "scale={}:{}:flags=lanczos",
@@ -646,139 +581,91 @@ pub fn build_decode_chain(video: &VideoPlan) -> String {
         .unwrap_or_else(String::new)
 }
 
-/// Geometry the model hands back: its input size scaled by what it says it does
-/// to geometry. Encoders reject odd widths, so the result is rounded up to even.
-pub fn model_output_geometry(inference: Option<&InferencePlan>) -> (u32, u32) {
-    let even = |value: f64| -> u32 {
-        let rounded = value.round().max(2.0) as u32;
+/// Geometry the chunk encoder must expect from the model stage.
+///
+/// With restoration enabled the network multiplies the input by its own scale
+/// factor; without it frames pass through at source resolution. Encoders reject
+/// odd widths, so the result is rounded up to even.
+pub fn model_output_geometry(video: &VideoPlan) -> (u32, u32) {
+    let even = |value: u32| {
+        let rounded = value.max(2);
         if rounded % 2 == 1 {
             rounded + 1
         } else {
             rounded
         }
     };
-    match inference {
-        Some(inference) => (
-            even(inference.width as f64 * inference.model_upscale),
-            even(inference.height as f64 * inference.model_upscale),
-        ),
-        None => (0, 0),
+    let width = video.source.square_width;
+    let height = video.source.square_height;
+    if video.restoration.enabled {
+        let scale = video.restoration.scale.max(1);
+        (
+            even(width.saturating_mul(scale)),
+            even(height.saturating_mul(scale)),
+        )
+    } else {
+        (even(width), even(height))
     }
 }
 
-/// Chooses the interpolation engine actually used, downgrading honestly when the
-/// requested one is not installed.
+/// Refuses a restoration request that nothing in this binary can serve.
 ///
-/// Returns the plan together with the engine that must execute it, so the caller
-/// can pick a real executor instead of assuming the FFmpeg path will do.
+/// The alternative that used to be here — carry on, reach the target raster with
+/// a Lanczos resample, and describe the result as restored — is the single most
+/// misleading thing this project has done, because the output really did get
+/// bigger and smoother, so nothing looked wrong.
+fn require_restoration_runtime(settings: &RestorationSettings) -> Result<()> {
+    if !settings.enabled {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "restoration with {} was requested but no restoration network can run it: the native \
+         Real-ESRGAN runtime (native/sr-native over ncnn) is not built into this binary yet, and \
+         its weights are not installed. Nothing is substituted for it — the previous build \
+         resampled with Lanczos and reported it as restoration. Use the `deterministic` or \
+         `preview` profile to run the rest of the pipeline.",
+        settings.model
+    )))
+}
+
+/// Resolves the interpolation decision, refusing rather than substituting.
+///
+/// There is exactly one interpolator this product runs: RIFE, through the native
+/// ncnn runtime. It is not wired up yet, so a request for it fails here, before
+/// any pixel moves, with a message that says what is missing. The alternative —
+/// emitting `minterpolate`, or duplicating frames and calling it interpolation —
+/// is the specific dishonesty this redesign exists to remove: the log would say
+/// "interpolated" while the picture got something else.
 fn resolve_interpolation(
     profile: &RestorationProfile,
-    engines: &EngineRegistry,
-    ff: &Ffmpeg,
     source_fps: Rational,
-    warnings: &mut Vec<String>,
-) -> (InterpolationPlan, Option<Arc<dyn InferenceEngine>>) {
+) -> Result<InterpolationPlan> {
     let multiplier = profile.interpolation.multiplier.max(1);
     let requested = profile.interpolation.method;
     if requested == InterpolationMethod::Off || multiplier <= 1 {
-        return (
-            InterpolationPlan {
-                enabled: false,
-                method: InterpolationMethod::Off,
-                source_fps,
-                target_fps: source_fps,
-                multiplier: 1,
-                engine: None,
-                scene_cuts_respected: true,
-                note: "interpolation disabled: source cadence preserved".into(),
-            },
-            None,
-        );
+        return Ok(InterpolationPlan {
+            enabled: false,
+            method: InterpolationMethod::Off,
+            source_fps,
+            target_fps: source_fps,
+            multiplier: 1,
+            scene_cuts_respected: true,
+            note: "interpolation disabled: source cadence preserved".into(),
+        });
     }
 
-    let post_ivtc = source_fps;
-    let target_fps = post_ivtc
-        .checked_mul(&Rational::from_i64(multiplier as i64))
-        .unwrap_or(post_ivtc);
-
-    let (method, engine_id, note, selected) = match requested {
-        InterpolationMethod::Plugin => match engines.select(InferenceTask::Interpolate) {
-            Some(engine) if engine.kind() == EngineKind::Plugin => {
-                let note = format!(
-                    "model interpolation via {} (native executor, shots processed separately)",
-                    engine.display_name()
-                );
-                (
-                    InterpolationMethod::Plugin,
-                    Some(engine.id().to_string()),
-                    note,
-                    Some(engine),
-                )
-            }
-            _ => {
-                warnings.push(
-                    "no interpolation plugin is installed: the requested model interpolation \
-                     cannot run, so frames are duplicated instead (no motion is synthesised)"
-                        .into(),
-                );
-                (
-                    InterpolationMethod::Duplicate,
-                    None,
-                    "frame duplication (no model backend available)".to_string(),
-                    None,
-                )
-            }
-        },
-        InterpolationMethod::Minterpolate => {
-            if ff.has_filter("minterpolate") {
-                (
-                    InterpolationMethod::Minterpolate,
-                    Some("ffmpeg-minterpolate".to_string()),
-                    "motion-compensated interpolation in software; expect a large slowdown".into(),
-                    None,
-                )
-            } else {
-                warnings.push("minterpolate filter missing: using frame duplication".into());
-                (
-                    InterpolationMethod::Duplicate,
-                    None,
-                    "frame duplication (minterpolate unavailable)".to_string(),
-                    None,
-                )
-            }
-        }
-        InterpolationMethod::Duplicate | InterpolationMethod::Off => (
-            InterpolationMethod::Duplicate,
-            None,
-            "frame duplication: deterministic, invents no motion".to_string(),
-            None,
-        ),
-    };
-
-    (
-        InterpolationPlan {
-            enabled: true,
-            method,
-            source_fps: post_ivtc,
-            target_fps,
-            multiplier,
-            engine: engine_id,
-            scene_cuts_respected: profile.interpolation.scene_cut_protection,
-            note: format!(
-                "{note}; {}x {:.3} -> {:.3} fps",
-                multiplier,
-                post_ivtc.to_f64(),
-                target_fps.to_f64()
-            ),
-        },
-        selected,
-    )
+    Err(Error::Unsupported(format!(
+        "{}x interpolation was requested but no interpolator can run it: the native RIFE runtime \
+         (native/sr-native over ncnn) is not built into this binary yet. Nothing is substituted \
+         for it — pass `--interpolate off`, or choose a profile whose interpolation is off, if \
+         you want the rest of the pipeline to run.",
+        multiplier
+    )))
 }
 
 /// The whole decision, in one place.
 pub fn build_plan(
     ff: &Ffmpeg,
-    engines: &EngineRegistry,
     manifest: &MediaManifest,
     temporal: &TemporalReport,
     scenes: &SceneReport,
@@ -790,10 +677,10 @@ pub fn build_plan(
     let mut warnings = Vec::new();
 
     let video_stream = manifest.primary_video().ok_or_else(|| {
-        crate::error::Error::Unsupported("the file has no video stream to convert".into())
+        Error::Unsupported("the file has no video stream to convert".into())
     })?;
     let fps = video_stream.fps().ok_or_else(|| {
-        crate::error::Error::Unsupported("the video frame rate is unknown".into())
+        Error::Unsupported("the video frame rate is unknown".into())
     })?;
     let (raw_w, raw_h) = video_stream.size().unwrap_or((0, 0));
     let (square_w, square_h) = video_stream.square_pixel_size().unwrap_or((raw_w, raw_h));
@@ -819,9 +706,14 @@ pub fn build_plan(
         choose_target(square_w.max(2) as u64, square_h.max(2) as u64, profile.restoration.max_upscale);
     let upscale_factor = target_height as f32 / square_h.max(1) as f32;
 
-    // --- interpolation ------------------------------------------------------
-    let (interpolation, interpolation_engine) =
-        resolve_interpolation(profile, engines, ff, effective_fps, &mut warnings);
+    // --- model tasks --------------------------------------------------------
+    //
+    // Both of these are checked before anything else about the video is decided,
+    // because they are the two things this build cannot do and must not pretend
+    // to. A refusal here is a refusal to produce a file at all: publishing one
+    // that quietly skipped the model is the outcome the check exists to prevent.
+    require_restoration_runtime(&profile.restoration)?;
+    let interpolation = resolve_interpolation(profile, effective_fps)?;
     if interpolation.enabled && interpolation.method != InterpolationMethod::Off {
         notes.push(format!(
             "interpolation: {} ({} cut(s) in this file are shot boundaries the interpolation \
@@ -868,62 +760,9 @@ pub fn build_plan(
 
     let estimated_frames = (duration_seconds * interpolation.target_fps.to_f64()).round() as u64;
 
-    // --- who executes the video work ----------------------------------------
-    //
-    // A model engine can only be used through the native executor, so the choice
-    // of executor follows from whether a model was actually selected — not from
-    // what the profile asked for.
-    let restoration_engine = if profile.restoration.enabled {
-        engines.model_engine()
-    } else {
-        None
-    };
-    let model_engine = interpolation_engine.clone().or_else(|| restoration_engine.clone());
-    let executor = if model_engine.is_some() {
-        VideoExecutor::NativeInference
-    } else {
-        VideoExecutor::FfmpegSinglePass
-    };
-    let inference = model_engine.as_ref().map(|engine| {
-        let caps = engine.capabilities();
-        let mut tasks = Vec::new();
-        if restoration_engine.is_some() && caps.restore {
-            tasks.push("restore".to_string());
-        }
-        if interpolation.method == InterpolationMethod::Plugin {
-            tasks.push("interpolate".to_string());
-        }
-        InferencePlan {
-            engine_id: engine.id().to_string(),
-            tasks: tasks.clone(),
-            temporal_window: caps.temporal_window.clamp(2, 5),
-            max_batch: caps.max_batch.max(1),
-            width: square_w as u32,
-            height: square_h as u32,
-            model_upscale: if tasks.iter().any(|t| t == "restore") {
-                caps.upscale
-            } else {
-                1.0
-            },
-            precision: caps.precision.clone(),
-            model: caps.model.clone(),
-            can_reconfigure: caps.can_reconfigure,
-            restore_strength: 1.0,
-            note: format!(
-                "{} → {}",
-                if caps.model.is_empty() {
-                    engine.display_name()
-                } else {
-                    caps.model.clone()
-                },
-                if tasks.is_empty() {
-                    "no task selected".to_string()
-                } else {
-                    tasks.join(" + ")
-                }
-            ),
-        }
-    });
+    // The executor is decided *after* the grain measurement below, because
+    // per-shot re-grain is the thing that forces the chunked path: a filter chain
+    // built once cannot give two shots different strengths.
 
     // ---- grain ------------------------------------------------------------
     //
@@ -967,6 +806,19 @@ pub fn build_plan(
             }
         }
     }
+    // --- who executes the video work ----------------------------------------
+    //
+    // Only the chunked executor can give one shot a different filter chain from
+    // its neighbour, so a measured per-shot re-grain forces it. The model stage
+    // will force it for the same reason — a network is not an FFmpeg filter —
+    // but there is no model stage in this build, so nothing else does.
+    let executor = if regrain_per_shot.is_empty() {
+        VideoExecutor::FfmpegSinglePass
+    } else {
+        VideoExecutor::Chunked
+    };
+    let measured_shots = regrain_per_shot.len();
+
     let mut video = VideoPlan {
         source: VideoSourceInfo {
             width: raw_w as u32,
@@ -993,7 +845,7 @@ pub fn build_plan(
         upscale_factor,
         interpolation,
         executor,
-        inference,
+        restoration: profile.restoration.clone(),
         regrain_strength: profile.output.regrain_strength,
         regrain_per_shot,
         filter_chain: String::new(),
@@ -1004,44 +856,21 @@ pub fn build_plan(
         estimated_frames,
     };
     video.pix_fmt = video.encoder.pix_fmt.clone();
-    // The model receives the target geometry the pixels must end up at, so the
-    // final resize happens after the model rather than before it.
-    video.target_width = target_width;
     video.decode_chain = build_decode_chain(&video);
-    video.filter_chain = if video.uses_model() {
-        build_post_chain(&video, model_output_geometry(video.inference.as_ref()))
+    video.filter_chain = if video.is_chunked() {
+        build_post_chain(&video, model_output_geometry(&video))
     } else {
         build_filter_chain(&video, (square_w as u32, square_h as u32))
     };
 
-    match (&video.executor, &video.inference) {
-        (VideoExecutor::NativeInference, Some(inference)) => {
+    match video.executor {
+        VideoExecutor::Chunked => {
             notes.push(format!(
-                "video executor: native inference — {} handles {} through a model session, \
-                 one shot at a time",
-                inference.engine_id,
-                if inference.tasks.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    inference.tasks.join(" + ")
-                }
-            ));
-            notes.push(format!(
-                "model sees {}x{} interleaved RGB at {} fps{}; final resize to {}x{} stays \
-                 deterministic (Lanczos) because the model does not invent pixels at that size",
-                inference.width,
-                inference.height,
-                effective_fps.to_f64(),
-                if (inference.model_upscale - 1.0).abs() > 0.001 {
-                    format!(", model upscales {:.2}x", inference.model_upscale)
-                } else {
-                    String::new()
-                },
-                target_width,
-                target_height
+                "video executor: chunked — one encode per chunk with a per-shot filter chain \
+                 over {measured_shots} measured shot(s), checkpointed as each one completes"
             ));
         }
-        _ => {
+        VideoExecutor::FfmpegSinglePass => {
             notes.push(
                 "video executor: one FFmpeg pass — no model session is opened, so nothing is \
                  restored or synthesised"
@@ -1063,17 +892,10 @@ pub fn build_plan(
              resamples. A restoration model is required for real detail."
         ));
     }
-    if profile.restoration.enabled && restoration_engine.is_none() {
-        warnings.push(
-            "the profile asks for model restoration but no inference plugin is installed: \
-             running the deterministic path instead"
-                .into(),
-        );
-    }
     if !profile.restoration.enabled {
         notes.push(
-            "restoration: disabled by the profile — no detail is invented (the deterministic \
-             default)"
+            "restoration: off (the `deterministic` configuration) — no detail is invented, and \
+             the output raster is reached by a deterministic resize"
                 .into(),
         );
     }
@@ -1083,11 +905,10 @@ pub fn build_plan(
 
     // --- budget -------------------------------------------------------------
     let gpus = crate::gpu::probe();
-    let vram = plan_vram_with(
+    let vram = plan_vram(
         profile.gpu.max_ai_vram_mib,
         profile.gpu.reserve_mib,
         &gpus,
-        engines.backend_free_mib(),
     );
     for note in &vram.notes {
         notes.push(note.clone());
@@ -1168,7 +989,6 @@ fn build_audio_plan(
 /// Convenience for the CLI and UI: a plan for a file, with analysis disabled.
 pub fn plan_without_analysis(
     ff: &Ffmpeg,
-    engines: &EngineRegistry,
     manifest: &MediaManifest,
     request: &PlanRequest,
 ) -> Result<ConversionPlan> {
@@ -1200,7 +1020,7 @@ pub fn plan_without_analysis(
         accurate_timestamps: false,
         notes: vec!["no shot analysis was run".into()],
     };
-    build_plan(ff, engines, manifest, &temporal, &scenes, None, request)
+    build_plan(ff, manifest, &temporal, &scenes, None, request)
 }
 
 /// Timestamp helper for the plan's shot list rendering.
@@ -1278,17 +1098,19 @@ mod tests {
             target_height: 960,
             upscale_factor: 2.0,
             interpolation: InterpolationPlan {
-                enabled: true,
+                enabled: method != InterpolationMethod::Off,
                 method,
                 source_fps: Rational::new(24000, 1001).unwrap(),
                 target_fps,
                 multiplier: 2,
-                engine: None,
                 scene_cuts_respected: true,
                 note: String::new(),
             },
             executor: VideoExecutor::FfmpegSinglePass,
-            inference: None,
+            restoration: RestorationSettings {
+                enabled: false,
+                ..RestorationSettings::default()
+            },
             regrain_strength: 0.0,
             regrain_per_shot: Vec::new(),
             filter_chain: String::new(),
@@ -1311,17 +1133,83 @@ mod tests {
     }
 
     #[test]
-    fn filter_chain_scales_then_interpolates_in_order() {
+    fn the_single_pass_chain_scales_but_never_interpolates() {
         let video = fake_video(
-            InterpolationMethod::Duplicate,
+            InterpolationMethod::Rife,
             Rational::new(48000, 1001).unwrap(),
         );
         let chain = build_filter_chain(&video, (720, 480));
-        let scale_at = chain.find("scale=").expect("scale present");
-        let interp_at = chain.find("framerate=").expect("interpolation present");
-        assert!(scale_at < interp_at, "scaling must precede interpolation: {chain}");
-        assert!(chain.contains("scale=1440:960:flags=lanczos"));
-        assert!(chain.contains("framerate=fps=47.952048"));
+        assert!(chain.contains("scale=1440:960:flags=lanczos"), "{chain}");
+        // The whole point of the redesign: this function has no way to add frames,
+        // so a plan that wants interpolation cannot reach it and be quietly served
+        // something else.
+        assert!(!chain.contains("framerate="), "{chain}");
+        assert!(!chain.contains("minterpolate="), "{chain}");
+    }
+
+    #[test]
+    fn a_request_for_rife_is_refused_rather_than_answered_with_minterpolate() {
+        let profile = RestorationProfile::safe_16gb();
+        let err = resolve_interpolation(&profile, Rational::new(24000, 1001).unwrap())
+            .expect_err("the default profile asks for RIFE and no runtime can serve it");
+        let text = err.to_string();
+        assert!(text.contains("RIFE"), "{text}");
+        assert!(
+            !text.contains("minterpolate") && !text.contains("duplicat"),
+            "the refusal must not offer a substitute algorithm: {text}"
+        );
+    }
+
+    #[test]
+    fn interpolation_off_resolves_to_a_plan_that_changes_no_frame_rate() {
+        let mut profile = RestorationProfile::safe_16gb();
+        profile.interpolation.method = InterpolationMethod::Off;
+        let fps = Rational::new(24000, 1001).unwrap();
+        let plan = resolve_interpolation(&profile, fps).expect("off is always available");
+        assert!(!plan.enabled);
+        assert_eq!(plan.multiplier, 1);
+        assert_eq!(plan.target_fps, fps);
+        assert_eq!(plan.method, InterpolationMethod::Off);
+    }
+
+    #[test]
+    fn the_text_form_matches_what_serde_writes() {
+        // `VideoExecutor` is both persisted in the plan and printed in the log.
+        // When those two spellings drifted apart (`ffmpeg_single_pass` on disk,
+        // `ffmpeg-single-pass` in the log) a test that hardcoded the readable one
+        // failed against the stored JSON — a small bug with a confusing symptom,
+        // and exactly the kind of thing that is cheaper to forbid than to debug.
+        for value in [VideoExecutor::FfmpegSinglePass, VideoExecutor::Chunked] {
+            let json = serde_json::to_string(&value).expect("a unit variant serialises");
+            assert_eq!(
+                json,
+                format!("\"{}\"", value.as_str()),
+                "{value:?} has two textual forms"
+            );
+            let round_tripped: VideoExecutor =
+                serde_json::from_str(&json).expect("and reads back");
+            assert_eq!(round_tripped, value);
+        }
+    }
+
+    #[test]
+    fn a_request_for_restoration_is_refused_rather_than_resampled() {
+        let settings = RestorationProfile::safe_16gb().restoration;
+        let err = require_restoration_runtime(&settings)
+            .expect_err("the default profile asks for Real-ESRGAN and nothing can serve it");
+        let text = err.to_string();
+        assert!(text.contains("RealESRGAN_x4plus"), "{text}");
+        assert!(
+            !text.contains("Lanczos resample to the target"),
+            "the refusal must not present a resample as the alternative: {text}"
+        );
+
+        // Turning it off is the supported configuration, and it must not error.
+        let off = RestorationSettings {
+            enabled: false,
+            ..settings
+        };
+        assert!(require_restoration_runtime(&off).is_ok());
     }
 
     #[test]
@@ -1350,17 +1238,21 @@ mod tests {
     }
 
     #[test]
-    fn minterpolate_chain_protects_scene_cuts() {
-        let video = fake_video(
-            InterpolationMethod::Minterpolate,
-            Rational::new(48000, 1001).unwrap(),
-        );
-        let chain = build_filter_chain(&video, (720, 480));
-        assert!(chain.contains("minterpolate="));
-        assert!(
-            chain.contains("scd=fdiff"),
-            "scene change detection must be on: {chain}"
-        );
+    fn the_filter_chain_has_no_interpolation_stage_at_all() {
+        // Superseded the old `minterpolate_chain_protects_scene_cuts`. The
+        // cut-safety contract did not disappear with `minterpolate`; it moved to
+        // the segment planner, which is where it belongs, because there it is
+        // enforced by never handing the model a pair that straddles a cut rather
+        // than by asking a filter to notice one. See
+        // `pipeline::segments::a_dissolve_guard_is_held_while_the_cut_is_still_synthesised_up_to_it`.
+        for method in [InterpolationMethod::Off, InterpolationMethod::Rife] {
+            let video = fake_video(method, Rational::new(48000, 1001).unwrap());
+            let chain = build_filter_chain(&video, (720, 480));
+            assert!(
+                !chain.contains("minterpolate") && !chain.contains("framerate"),
+                "the single-pass chain must not be able to invent frames: {chain}"
+            );
+        }
     }
 
     #[test]

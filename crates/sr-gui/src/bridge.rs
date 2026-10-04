@@ -5,7 +5,6 @@
 //! `std::thread` because `PipelineRunner::run` is blocking by design.
 
 use sr_core::ffmpeg::Ffmpeg;
-use sr_core::infer::EngineRegistry;
 use sr_core::media::probe;
 use sr_core::pipeline::plan::PlanRequest;
 use sr_core::pipeline::runner::{PipelineRunner, RunnerOptions};
@@ -58,19 +57,21 @@ impl StartupError {
 #[derive(Clone)]
 pub struct Engine {
     ff: Arc<Ffmpeg>,
-    engines: Arc<EngineRegistry>,
     store: Arc<Store>,
     bus: EventBus,
     cancel: Arc<AtomicBool>,
 }
 
 impl Engine {
-    /// Discovers FFmpeg, probes the inference engines and opens the job store.
-    /// Called once, from `AppView::new`.
+    /// Discovers FFmpeg and opens the job store. Called once, from
+    /// `AppView::new`.
+    ///
+    /// There is no inference probe to run alongside it any more: the AI runtime is
+    /// a statically linked part of the binary, not something to be discovered, so
+    /// the only things that can fail here are the two external dependencies.
     pub fn bootstrap() -> Result<Engine, StartupError> {
         let ff = Ffmpeg::discover().map_err(|err| StartupError::Ffmpeg(err.to_string()))?;
         let ff = Arc::new(ff);
-        let engines = Arc::new(EngineRegistry::probe(Arc::clone(&ff)));
 
         let store_path = Store::default_path();
         let store = Store::open(&store_path).map_err(|err| {
@@ -79,7 +80,6 @@ impl Engine {
 
         Ok(Engine {
             ff,
-            engines,
             store: Arc::new(store),
             bus: EventBus::new(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -98,27 +98,18 @@ impl Engine {
         &self.ff.version
     }
 
-    /// Compact form for the status bar; the full line goes in the engines panel.
+    /// Compact form for the status bar; the full line goes in the runtime panel.
     pub fn ffmpeg_version_short(&self) -> String {
         self.ff.version_short()
     }
 
-    /// `(ready, total)` engines, for the header indicator.
-    pub fn engine_readiness(&self) -> (usize, usize) {
-        self.engines
-            .engines()
-            .iter()
-            .fold((0usize, 0usize), |(ready, total), engine| {
-                let is_ready = matches!(
-                    engine.status(),
-                    sr_core::infer::EngineStatus::Ready
-                );
-                (ready + usize::from(is_ready), total + 1)
-            })
-    }
-
-    pub fn engines(&self) -> &EngineRegistry {
-        &self.engines
+    /// What the AI layer can do, for the header indicator.
+    ///
+    /// It is a status line rather than a `(ready, total)` pair because there is
+    /// nothing to count any more: exactly one runtime exists, and either it is
+    /// built into this binary or the two model tasks are refused.
+    pub fn ai_runtime(&self) -> &'static str {
+        sr_core::pipeline::ai_runtime_line()
     }
 
     /// Asks the running job (if any) to stop at the next safe point.
@@ -141,7 +132,6 @@ impl Engine {
         let scratch = scratch_dir(&request.output);
         let runner = PipelineRunner::new(
             Arc::clone(&self.ff),
-            Arc::clone(&self.engines),
             self.bus.clone(),
             Arc::clone(&self.store),
             Arc::clone(&self.cancel),

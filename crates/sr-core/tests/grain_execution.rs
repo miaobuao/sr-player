@@ -6,14 +6,14 @@
 //! out as different grain in the two halves of the finished film.
 //!
 //! The fixture is two shots with grain differing by four to one and a hard cut
-//! between them. The pipeline runs the native path - the model interpolates, then
-//! each chunk is encoded with its own shot's `noise` strength - and the output is
-//! measured per half.
+//! between them. The pipeline runs the chunked path - and a *measured* per-shot
+//! re-grain is now the only thing that selects it, since the model stages went with
+//! the inference layer - so each chunk is encoded with its own shot's `noise`
+//! strength, and the output is measured per half.
 //!
-//! Skips itself when FFmpeg or the example plugin is unavailable.
+//! Skips itself when FFmpeg is unavailable.
 
 use sr_core::ffmpeg::{args, capture, Ffmpeg};
-use sr_core::infer::EngineRegistry;
 use sr_core::pipeline::grain::{estimate_sigma, shot_sigma, GrainEstimate};
 use sr_core::pipeline::plan::PlanRequest;
 use sr_core::pipeline::profile::{InterpolationMethod, RestorationProfile};
@@ -32,27 +32,6 @@ fn ffmpeg_or_skip() -> Option<Arc<Ffmpeg>> {
             return None;
         }
     }
-}
-
-fn example_plugin() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let name = if cfg!(windows) {
-        "sr_infer_plugin_example.dll"
-    } else if cfg!(target_os = "macos") {
-        "libsr_infer_plugin_example.dylib"
-    } else {
-        "libsr_infer_plugin_example.so"
-    };
-    // Both paths are legitimate cargo outputs, and *which one is current depends on
-    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
-    // building it as a dependency writes `deps/`. Taking the first that existed loaded
-    // a stale binary and silently invalidated a test - the injected fault was in the
-    // newer file and never ran, and the test could not tell.
-    [dir.join(name), dir.join("deps").join(name)]
-        .into_iter()
-        .filter(|path| path.exists())
-        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
 }
 
 /// Two shots, two seconds each, with grain differing by four to one.
@@ -196,19 +175,24 @@ fn report_plan(state: &Path, job: &str, expect_strengths: bool) -> Vec<f64> {
     per_shot
 }
 
+/// Runs the job and returns the output path.
+///
+/// `regrain` is the switch that also picks the executor: 0 is one FFmpeg pass,
+/// positive forces the measurement and therefore the per-chunk path.
 fn run(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path, job: &str, regrain: f32) -> PathBuf {
     let output = dir.join(format!("{job}.mkv"));
     let runner = PipelineRunner::new(
         Arc::clone(ff),
-        Arc::new(EngineRegistry::probe(Arc::clone(ff))),
         EventBus::new(),
         Arc::new(Store::open(&dir.join(format!("{job}.sqlite3"))).expect("state store")),
         Arc::new(AtomicBool::new(false)),
         dir.join(format!("{job}-scratch")),
     );
     let mut profile = RestorationProfile::deterministic();
-    profile.interpolation.method = InterpolationMethod::Plugin;
-    profile.interpolation.multiplier = 2;
+    // No model task: interpolation is off, so the only thing the chunked executor
+    // is doing here is giving each shot its own grain strength.
+    profile.interpolation.method = InterpolationMethod::Off;
+    profile.interpolation.multiplier = 1;
     profile.restoration.enabled = false;
     profile.restoration.max_upscale = 1.0;
     profile.audio.enabled = false;
@@ -237,13 +221,8 @@ fn each_shot_is_re_grained_with_its_own_strength() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
     };
-    let Some(plugin) = example_plugin() else {
-        eprintln!("SKIPPED: the example inference plugin was not built");
-        return;
-    };
     let dir = tempfile::tempdir().expect("temp dir");
     let input = build_fixture(&ff, dir.path());
-    std::env::set_var("SR_INFER_PLUGIN", &plugin);
 
     // The source, measured in the same windows the output will be measured in.
     let source_quiet = grain_in_window(&ff, &input, 0.5, 1.0);
@@ -262,8 +241,8 @@ fn each_shot_is_re_grained_with_its_own_strength() {
     // Re-grain off: the same job, so the difference in the output can be attributed
     // to the per-shot strengths rather than to the encoder.
     let plain = run(&ff, &input, dir.path(), "plain", 0.0);
-    // The same windows as the source: doubling the rate preserves the duration,
-    // so the two halves are in the same place in time.
+    // The same windows as the source: no rate change and no frame is dropped, so
+    // the two halves are in the same place in time.
     let plain_quiet = grain_in_window(&ff, &plain, 0.5, 1.0);
     let plain_heavy = grain_in_window(&ff, &plain, 2.5, 1.0);
     report_plan(&dir.path().join("plain.sqlite3"), "plain", false);
@@ -295,9 +274,9 @@ fn each_shot_is_re_grained_with_its_own_strength() {
     // why it is measured above: without that reference, a difference between the
     // halves could be the source's own grain surviving rather than the strengths
     // being applied.
-    // Measured: source 0.0078 / 0.0364, without re-grain 0.0026 / 0.0208, with
-    // re-grain 0.0013 / 0.0364. The heavy shot comes back at its source amplitude
-    // almost exactly, and the two halves end up far apart.
+    // Measured on the model-free chunked path: source 0.0078 / 0.0364, without
+    // re-grain 0.0046 / 0.0312, with re-grain 0.0046 / 0.0390. The heavy shot comes
+    // back at its source amplitude, and the two halves end up far apart.
     assert!(
         heavy.sigma > quiet.sigma * 1.5,
         "the two shots must come out with different grain: quiet {:.4} vs heavy {:.4}",
@@ -311,32 +290,22 @@ fn each_shot_is_re_grained_with_its_own_strength() {
         source_heavy.sigma,
         heavy.sigma
     );
-    // **The quiet half is deliberately not asserted, because it went the wrong way**:
-    // 0.0026 without re-grain and 0.0013 with it. Adding `noise=alls=5.2` cannot lower
-    // the high-frequency energy of a frame, so something else is happening. Both runs
-    // encode the same model output, so the difference is either in the chain built for
-    // that chunk or in what the encoder does with it - an open question, not a passing
-    // assertion. What the numbers *do* establish is that the heavy shot received its
-    // own strength: it moved three quarters of the way back to its source amplitude
-    // while the other half did not, which one global strength cannot do.
-    // The quiet half measured *lower* with re-grain than without (0.0026 to 0.0013),
-    // which the plan above shows is not a grain-chain fault: the strengths are there,
-    // they are different, and the grainy half lands on its source amplitude. What the
-    // numbers point to is the encoder. The fixture's quiet shot is flat grey, and a
-    // lossy encoder facing a flat field spends almost nothing on the fine noise added
-    // to it - the added detail is exactly what a rate-distortion optimiser discards -
-    // so the measured residual can fall even though more was put in. That is a
-    // hypothesis consistent with every number here, not a proven mechanism, and the
-    // fixture is pathological in the way that makes it visible: real film is not flat
-    // grey, and its grain survives because there is detail for the encoder to spend
-    // bits on.
+    // **The quiet half is deliberately not asserted, and the fixture is why.** It is
+    // flat grey, and a lossy encoder facing a flat field spends almost nothing on the
+    // fine noise added to it - the added detail is exactly what a rate-distortion
+    // optimiser discards - so what that half measures says as much about the encoder
+    // as about the grain chain. Measured here it is unmoved (0.0046 with and without
+    // re-grain), which is consistent with that reading but does not prove it; it is
+    // recorded rather than asserted. Real film is not flat grey, and its grain
+    // survives because there is detail for the encoder to spend bits on.
     //
-    // It is not asserted, and the assertion that replaced it is the one the data
-    // supports.
+    // What the numbers *do* establish is the property this test is for: the heavy shot
+    // moved back to its own source amplitude while the other half did not move at all,
+    // and one global strength cannot do that - it would move both by the same amount.
+    // The assertion that carries that is the pair above.
     eprintln!(
         "note: the quiet half measured {:.4} without re-grain and {:.4} with it; the plan \
-         carried the strengths, so this is an encoder interaction on flat grey rather \
-         than a fault in the grain chain",
+         carried two different strengths, and only the grainy half moved",
         plain_quiet.sigma, quiet.sigma
     );
 }

@@ -8,10 +8,21 @@ sr-gui / sr-cli        presentation: pick a file, render events
         ▼
 sr-core                all media work: probe, timeline, decode, analysis,
         │              DSP, scheduling, state, child processes
-        ▼
-FFmpeg                 decode / filter / encode / mux
-   └── optional plugin an accelerator behind a C ABI, never required
+        │
+        ├─────────────► FFmpeg      decode / filter / encode / mux
+        │
+        └─────────────► sr-native   the one AI runtime (C++ over ncnn, Vulkan)
+                                    RIFE 4.25 + Real-ESRGAN x4plus, in-process
 ```
+
+There is exactly one inference runtime in the production tree, and it is not
+written in this repository's Rust. That is a deliberate reversal: this project
+previously carried its own ncnn checkpoint parser, graph evaluator, tensor
+scheduler and WGSL kernels, which made it a second-rate reimplementation of a
+runtime that already exists, is faster, and supports three vendors' Vulkan
+drivers. All of it is gone. What remains here is the part that is actually this
+project's work: media correctness, automatic decisions, chunking and recovery,
+audio, QC, and the refusal to claim a model ran when it did not.
 
 Nothing in `sr-core` knows what a window is. Nothing in `sr-gui` knows what a
 codec is: it subscribes to an event bus and renders. That is what makes the
@@ -81,22 +92,27 @@ detector produces a gentle touch, not a confident mistake.
 * The plan carries an **encoder chain**, not one encoder. `-encoders` advertises
   encoders that cannot open on the current GPU; the runner walks the chain.
 * VRAM policy is `min(13 GiB, free − 2.5 GiB)` — measured against *free* memory,
-  because the desktop and the driver are using the same card. OOM walks a ladder
-  ordered by cost: throughput first (block swap), then quality (VAE tile), then
-  temporal consistency (batch). Batches are restricted to valid `4n+1` values
-  (`5 → 1`), because `3` is not a batch this class of model can accept.
-* A model backend that answers `SR_ERR_OUT_OF_MEMORY` is not a failure: the
-  executor tells the session about the smaller working set (or reports that the
-  backend cannot apply it in place) and runs the *same segment* again. The
-  reference plugin can inject that fault on demand, so the ladder is tested
-  end to end rather than by inspection.
-* A backend that fails outright **fails the job**. It is not silently replaced by
-  a deterministic encode: the plan promised a frame rate and a level of detail
+  because the desktop and the driver are using the same card. The only working-set
+  knob the two networks this project runs actually have is the restoration **tile
+  edge**, so that is the whole ladder: `auto → 512 → 384 → 256 → 192 → 128`. It is
+  a short ladder because it is an honest one. A tile size cannot free memory inside
+  an FFmpeg encoder, so the encoder path does not offer the ladder as a pretend
+  fix — an encoder OOM walks the encoder chain like any other encoder failure.
+* A model stage that fails outright **fails the job**. It is not silently replaced
+  by a deterministic encode: the plan promised a frame rate and a level of detail
   that the fallback cannot produce, so the fallback's own QC stage would reject
   the result — with a message ("planned 48 fps, got 24") that hides the real
   reason. The recovery path is a re-run, which resumes from the committed chunks.
-* The worker-per-stage rule is documented in `infer`: one model resident at a
-  time, stages sequenced, because two models do not fit on a 16 GB card.
+* **Nothing is substituted for a model.** A request for restoration or
+  interpolation that the runtime cannot serve is refused before a pixel moves, with
+  a message naming what is missing. The two things this replaced — resampling with
+  Lanczos and calling it restoration, and running `minterpolate` and calling it
+  model interpolation — both produced a log that said one thing and a picture that
+  had received another, which is the failure mode this whole design is arranged
+  against.
+* One model at a time. Restoration and interpolation are sequenced rather than
+  overlapped, because two networks plus their activation buffers do not fit on a
+  16 GB card that is also driving a desktop.
 
 ### Publish atomically
 
@@ -136,86 +152,81 @@ Two details decide whether an unattended run OOMs:
 * An integrated GPU's "device-local" heap is system RAM. It is reported as shared,
   excluded from `free_mib`, and never chosen as the device a model runs on.
 
-The backend's own device list wins over the probe when a backend is installed: it
-is the thing that will actually allocate, and its numbering need not agree with
-the probe's about which device is number zero.
+When the native runtime lands, its own device list becomes the authority for which
+device a model runs on: it is the thing that will actually allocate, and its
+numbering need not agree with this probe's about which device is number zero. The
+Rust probe stays for the *planner* and the UI, where it is the only source of a
+memory budget before any model is open.
 
-## The inference ABI
+## The one AI runtime
 
-`include/sr_infer.h` defines ABI **v2**: device enumeration (`sr_infer_devices`),
-session lifecycle (`sr_infer_open` / `sr_infer_close`), capability query
-(`sr_infer_query`), execution (`sr_infer_execute`), async fences
-(`sr_infer_poll`) and structured errors (`sr_infer_last_error`). A job carries an
-N-frame temporal window, an op (`restore` / `interpolate` / `scale`), a dtype and
-layout, a tile size, a rational timestamp per frame, a chunk id and a seed. Every
-struct starts with its own `struct_size`, so the ABI can grow without breaking
-2.0 binaries.
+`native/sr-native` is a C++ layer over a commit-pinned ncnn, and it is the only
+thing in the tree that executes a neural network. Its ABI is deliberately shaped
+like the product instead of like a framework:
 
-Version 1 -- one call, two 8-bit frames in, one frame out -- is rejected at load
-time with a message that says to recompile against the header. It was a
-prototype: it could not express a temporal window, a device or a memory budget,
-so a plugin could be *loaded* with no way to *run a model*.
+```c
+typedef struct sr_context  sr_context;    /* one device, one Vulkan instance   */
+typedef struct sr_rife     sr_rife;       /* RIFE 4.25, ensemble off           */
+typedef struct sr_restorer sr_restorer;   /* RealESRGAN_x4plus                 */
 
-A plugin can be backed by Vulkan compute, DirectML, OpenVINO, MIGraphX, TensorRT,
-ncnn or a CPU kernel; the engine only asks what it can do and hands it frames.
-`crates/sr-infer-plugin-example` is a reference shared library implementing that
-ABI with **no dependency on `sr-core`** (it keeps its own copies of the structs, so
-a drift between the header and the engine's bindings fails a test instead of
-misreading memory).
+int  sr_device_count(void);
+int  sr_device_info(int index, sr_device_info_t* out);
+sr_context*  sr_context_create(int device_index);
+sr_restorer* sr_restorer_create(sr_context*, const char* model_dir);
+int          sr_restorer_process(sr_restorer*, const sr_image*, sr_image*, int scale, int tile);
+sr_rife*     sr_rife_create(sr_context*, const char* model_dir);
+int          sr_rife_process(sr_rife*, const sr_image* prev, const sr_image* next,
+                             float timestep, sr_image* out);
+```
 
-`crates/sr-infer-gpu` is the same contract implemented on Vulkan with WGSL kernels
-compiled by naga at runtime — no shader compiler, no SDK, and Vulkan only, because
-a backend that calls itself Vulkan and quietly runs on DX12 would be the kind of
-claim this project exists to stop making. It is a **test dependency** of `sr-core`:
-the shipped engine has no GPU API dependency at all, and the engine's own test
-suite loads the backend as a plugin, exactly as a user would.
+There is no `sr_tensor`, no `sr_graph`, no `sr_operator` and no
+`sr_execute_graph`, because this program is not a tensor framework. It runs two
+networks, and the ABI says so.
 
-Its quality is measured, not asserted:
+Three consequences are worth stating, because each one removes a class of bug:
 
-| check | result |
-|---|---|
-| WGSL kernels vs an independent Rust implementation | bit-identical on every pixel |
-| NVIDIA vs AMD driver, same input | bit-identical |
-| rigid translation vs the hidden middle frame | interior PSNR infinite (exact); frame duplication: 13.8 dB |
-| ABI contract: every output slot written | checked, after a version filled only the synthesised slots |
+* **RIFE takes a pair and a timestep.** It cannot be handed a window, so it cannot
+  be handed a pair that straddles a cut: the executor simply never constructs one.
+  The cut-safety guarantee is a property of the call shape rather than a filter
+  setting that a future edit could drop.
+* **Frames never become files.** Decode → `sr_image` → ncnn → `sr_image` → encode,
+  all in memory. No PNG round trip, no child process per frame, no temporary
+  directory, so there is no file lifetime to get wrong and no image codec in the
+  quality path.
+* **The model does not decide the output raster.** A model scale is a resampling
+  factor; landing on the target size is a separate, deterministic resize, and it
+  is labelled as such in the plan rather than presented as recovered detail.
 
-That last row is the instructive one. The backend's interpolation was correct, the
-frame count was correct and the project's own checks passed — while every
-pass-through frame in the file was blank, because the plugin wrote only the slots
-it synthesised. Only looking at the pixels of the committed chunk caught it, which
-is why `tests/gpu_execution.rs` decodes the intermediate and measures it instead of
-trusting the log.
+The models themselves are pinned by hash in a manifest and are never
+redistributed with the source. RIFE is fixed at **4.25 with `ensemble = false`**
+— not `rife-HD`, not `4.6`, and not the heavier variants — because a single
+frozen model is what makes "zero per-title tuning" a testable claim instead of a
+menu.
 
-Engines are ranked and selected: plugin (model) > `minterpolate`
-(motion-compensated, FFmpeg) > deterministic resample. The baseline always
-exists, so the pipeline always has a correct answer.
+### What the executor promises the runtime
 
-### What executes the model
-
-Selection is not execution. `pipeline::segments` turns the shot list into an
-exact sequence of model calls and output slots; `pipeline::native` drives it:
+`pipeline::segments` turns the shot list into an exact sequence of model calls and
+output slots, and `pipeline::native` is the thing that will drive it:
 
 ```text
-shots ──► segments ──► chunks ──► decode ─► session ─► chunk file ─► concat ─► mux
-           (never      (resume                  (sr_infer_execute)
+shots ──► segments ──► chunks ──► decode ─► model ─► chunk file ─► concat ─► mux
+           (never      (resume
             across      unit)
             a cut)
 ```
 
 A segment covers input frames `[first..=last]` and emits output slots
-`m*first..=m*last`; consecutive segments overlap by one frame and drop the slot
-the previous one already wrote, so the counts telescope to exactly `m*(n-1)+1`
+`m*first..=m*last`; consecutive segments overlap by one frame and drop the slot the
+previous one already wrote, so the counts telescope to exactly `m*(n-1)+1`
 regardless of how the work was split. A segment containing a shot boundary or a
 dissolve guard is `Hold`: frames are repeated and **the model is not called at
-all**. That is what makes "nothing is synthesised across a cut" a property of the
-data flow rather than a promise to a filter.
+all**.
 
-`minterpolate` is never used to satisfy a request for model interpolation: if the
-plan says `InterpolationMethod::Plugin` then the executor is
-`VideoExecutor::NativeInference`, and the two are cross-checked by tests. If no
-plugin is installed the plan downgrades *loudly* to frame duplication, with a
-warning in the plan and `ffmpeg-single-pass` in the executor row -- it does not
-quietly run a different algorithm.
+The planner and its tests exist today and are exercised independently of the
+runtime. What does not exist yet is the executor's model stage: a `Synthesise`
+segment currently fails loudly, saying that the plan asked for synthesised frames
+and that there is no interpolator in this binary, rather than filling them in some
+other way. That error is the seam where `sr_rife_process` goes.
 
 ## Stage map
 
@@ -226,17 +237,17 @@ quietly run a different algorithm.
 | Scenes | native shot detection → shots with rational timestamps, measured on the **decoded** cadence | yes |
 | AudioAnalysis | `ebur128` + native BS.1770 + dialogue detection → LDR decision | yes |
 | Plan | executor, geometry, encoder chain, VRAM budget, working set, reasons and warnings | yes |
-| Restore / Interpolate | a model session per job; per-segment calls; OOM walks the degrade ladder | per chunk |
+| Restore / Interpolate | *not built*: a request for either is refused before a pixel moves; the segment plan it will consume is already computed and tested | — |
 | Regrain | grain measured per shot from the source, then applied per chunk | per chunk |
 | AudioProcess | dialogue rider + band duck → float WAV on disk (never in RAM) | chunk row |
-| Encode | native path: one encode per chunk + concat; deterministic path: one FFmpeg pass | per chunk |
+| Encode | chunked: one encode per chunk + concat; single-pass: one FFmpeg pass | per chunk |
 | Mux | concatenated video + enhanced track + originals + subtitles + attachments + chapters | progress events |
 | Qc | 9-11 checks comparing the output with the plan | yes |
 
 | executor | Restore / Interpolate / Regrain |
 |---|---|
 | `ffmpeg-single-pass` | folded into the encode pass, with honest notes about what is *not* happening |
-| `native-inference` | decode → `sr_infer_execute` per segment → per-chunk encode → concat → mux |
+| `chunked` | decode → per-chunk encode with a per-shot chain → concat → mux; the model stage drops in between decode and encode |
 
 ## Memory
 
