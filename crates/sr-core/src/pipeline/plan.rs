@@ -617,6 +617,37 @@ pub fn model_output_geometry(video: &VideoPlan) -> (u32, u32) {
     }
 }
 
+/// What size to hand the restoration model.
+///
+/// The model is fixed at `scale`, so the input that lands exactly on the canvas is
+/// `canvas / scale` — and feeding it that, rather than the whole source, is 33%
+/// faster end to end. **It also costs 1.7 to 2.8 dB of fidelity**, measured against
+/// known originals on two independent photographs:
+///
+/// | fixture | Lanczos | input = canvas/scale | input = source |
+/// |---|---|---|---|
+/// | photograph 1 | 33.69 dB | 28.48 dB | 30.16 dB |
+/// | photograph 2 | 39.03 dB | 35.66 dB | 38.45 dB |
+///
+/// So the model gets the source, and the surplus is removed by the downscale to the
+/// canvas afterwards. It has to be this way round because the reduction happens
+/// *before* the model: the model cannot recover information that was thrown away
+/// before it saw the frame, and it responds by inventing more -- which the detail
+/// measurement confirms, 4,971,358 PNG bytes against 4,770,727.
+///
+/// This is a function with a test rather than an inline expression because it was
+/// once an inline expression that was changed on a wall-clock measurement alone,
+/// with the quality claim explicitly withdrawn as unsupported. It is now supported,
+/// and it says the opposite.
+pub fn restoration_input_size(
+    canvas: (u32, u32),
+    scale: u32,
+    source: (u32, u32),
+) -> (u32, u32) {
+    let _ = (canvas, scale);
+    source
+}
+
 /// Whether a plan has to run on the chunked executor.
 ///
 /// A network is not an FFmpeg filter, so any plan that runs one does. This is a
@@ -1274,6 +1305,24 @@ mod tests {
     /// non-performance of a model task, reachable from the command line, and it is
     /// the precise failure this whole architecture exists to remove.
     #[test]
+    /// The measurement that decides this is in `restoration_input_size`'s doc
+    /// comment. The test exists so that changing it requires deleting a number.
+    #[test]
+    fn the_restoration_model_is_given_the_whole_source() {
+        // A 720x480 source and a 1620x1080 canvas with a 4x model: the tempting
+        // input is 405x270, which lands exactly on the canvas and is 33% faster.
+        // It is also 1.7 to 2.8 dB less faithful on two measured photographs.
+        assert_eq!(
+            restoration_input_size((1620, 1080), 4, (720, 480)),
+            (720, 480),
+            "reducing the model's input before it runs is the change that cost fidelity"
+        );
+        // Nothing here should ever enlarge: a source smaller than the canvas is
+        // handed over as-is, because inventing pixels before the model sees them
+        // would be the resampler doing restoration's job.
+        assert_eq!(restoration_input_size((1620, 1080), 4, (320, 240)), (320, 240));
+    }
+
     fn a_plan_that_runs_a_model_never_uses_the_single_pass_executor() {
         // Restoration alone. This is the case that was wrong.
         assert!(needs_chunked_executor(false, true, false));

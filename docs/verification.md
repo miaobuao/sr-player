@@ -147,6 +147,24 @@ which measures high-frequency content and **not** correctness.
 | Lanczos upscale | 33.69 dB | 1,174,080 |
 | the pipeline | 28.48 dB | 4,971,358 |
 
+### The model's input size, which is the decision this table settles
+
+An earlier round handed the model `canvas / scale` instead of the source — 404x270
+rather than 720x480 — because that lands exactly on the canvas and is 33% faster. It
+was adopted on a wall-clock measurement with the quality claim explicitly withdrawn.
+Measured properly, on two independent photographs:
+
+| fixture | Lanczos | input = canvas/scale | input = source |
+|---|---|---|---|
+| photograph 1 | 33.69 dB | 28.48 dB | **30.16 dB** |
+| photograph 2 | 39.03 dB | 35.66 dB | **38.45 dB** |
+
+The reduction costs 1.7 to 2.8 dB and **has been reverted**. It happens before the
+model, and a model cannot recover information thrown away before it saw the frame;
+it responds by inventing more, which the detail measurement confirms (4,971,358 PNG
+bytes against 4,770,727). The policy is now a function with a test, so changing it
+again means deleting a number rather than editing an expression.
+
 ### What this says
 
 **On both fixtures restoration scores several dB below a plain Lanczos upscale on

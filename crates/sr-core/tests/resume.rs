@@ -75,7 +75,13 @@ fn build_fixture(ff: &Ffmpeg, dir: &Path) -> PathBuf {
         "testsrc=size=320x240:rate=24",
         "smptebars=size=320x240:rate=24",
     ] {
-        argv.extend(args(&["-t", "1", "-f", "lavfi", "-i", source]));
+        // Two seconds each, ten in total. The interrupted run below is cancelled by a
+        // watcher polling the store, and at one second per source the whole job
+        // finished before the poll saw two committed chunks whenever the workspace
+        // suite was running concurrently. That is a race in the harness rather than in
+        // the engine, and the fix is more work rather than a retry -- the same one
+        // applied to cli_resume.rs for the same reason.
+        argv.extend(args(&["-t", "2", "-f", "lavfi", "-i", source]));
     }
     argv.extend(args(&[
         "-filter_complex",

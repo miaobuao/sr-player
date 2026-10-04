@@ -368,13 +368,12 @@ impl<'a> NativeExecutor<'a> {
         // ideal input is handed over as-is, because inventing pixels before the model
         // sees them would be the resampler doing restoration's job.
         //
-        // Rounded down to even so the chroma-free RGB path stays aligned and the
-        // geometry is stable frame to frame.
-        let even = |value: u32| value.max(2) & !1u32;
+
         let (model_w, model_h) = if restorer.is_some() {
-            (
-                even(model_size.0 / scale.max(1) as u32).min(width),
-                even(model_size.1 / scale.max(1) as u32).min(height),
+            crate::pipeline::plan::restoration_input_size(
+                model_size,
+                scale.max(1) as u32,
+                (width, height),
             )
         } else {
             (width, height)
