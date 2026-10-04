@@ -599,11 +599,19 @@ pub fn model_output_geometry(video: &VideoPlan) -> (u32, u32) {
     let width = video.source.square_width;
     let height = video.source.square_height;
     if video.restoration.enabled {
-        let scale = video.restoration.scale.max(1);
-        (
-            even(width.saturating_mul(scale)),
-            even(height.saturating_mul(scale)),
-        )
+        // The model is fixed at 4x and the deliverable is the target canvas, so the
+        // downscale has to happen somewhere. It happens here -- between restoration
+        // and interpolation -- rather than in the encoder's filter chain, which is
+        // where it used to be and which put it *after* interpolation: RIFE was being
+        // asked to align 2880x1920 frames whose every fourth pixel was then thrown
+        // away, 3.2x the work for a 1620x1080 file, and the frames it synthesised
+        // were resampled on the way out.
+        //
+        // Whatever the model emits is now brought to exactly the canvas, so nothing
+        // resamples a synthesised frame and the encoder's post-chain has no work to
+        // do. `resize` in `pipeline::resize` is deterministic, which is what makes
+        // the result reproducible frame for frame.
+        (even(video.target_width), even(video.target_height))
     } else {
         (even(width), even(height))
     }

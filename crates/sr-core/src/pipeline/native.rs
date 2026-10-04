@@ -355,6 +355,32 @@ impl<'a> NativeExecutor<'a> {
             _ => (None, 1, 0),
         };
 
+        // The model emits source x scale; the deliverable is the canvas. Rather than
+        // let the encoder's filter chain do that after interpolation, it is done here
+        // so nothing resamples a synthesised frame.
+        let resampler = match restorer.is_some() && (model_size.0, model_size.1) != (width, height) {
+            true => Some(crate::pipeline::resize::Resampler::new(
+                (width * scale.max(1) as u32) as usize,
+                (height * scale.max(1) as u32) as usize,
+                model_size.0 as usize,
+                model_size.1 as usize,
+            )),
+            false => None,
+        };
+        if let Some(_) = &resampler {
+            ctx.reporter.info(
+                Some(Stage::Restore),
+                format!(
+                    "target canvas: {}x{} -> {}x{}, resampled before interpolation so the model's \
+                     output is never resampled after it",
+                    width * scale.max(1) as u32,
+                    height * scale.max(1) as u32,
+                    model_size.0,
+                    model_size.1
+                ),
+            );
+        }
+
         let mut source = FrameSource::new(
             stdout,
             frame_bytes,
@@ -363,6 +389,8 @@ impl<'a> NativeExecutor<'a> {
             restorer,
             scale,
             tile,
+            (width * scale.max(1) as u32, height * scale.max(1) as u32),
+            resampler,
             model_size,
         );
         let existing = self.committed_chunks(ctx.job_id)?;
@@ -743,6 +771,13 @@ struct FrameSource {
     tile: i32,
     /// The geometry once the model has run: the source raster times the scale.
     restored_size: (u32, u32),
+    /// Brings the model's output to the target canvas before anything else sees it.
+    /// `None` when no model ran, in which case the decoder's raster is already what
+    /// the encoder expects and there is nothing to resample.
+    resampler: Option<crate::pipeline::resize::Resampler>,
+    /// What the resampler produces, kept alongside it so a frame can be labelled
+    /// without asking the resampler what it does.
+    canvas: (u32, u32),
 }
 
 impl FrameSource {
@@ -755,6 +790,8 @@ impl FrameSource {
         scale: i32,
         tile: i32,
         restored_size: (u32, u32),
+        resampler: Option<crate::pipeline::resize::Resampler>,
+        canvas: (u32, u32),
     ) -> Self {
         FrameSource {
             reader,
@@ -771,6 +808,8 @@ impl FrameSource {
             scale,
             tile,
             restored_size,
+            resampler,
+            canvas,
         }
     }
 
@@ -830,6 +869,7 @@ impl FrameSource {
         };
         let (out_w, out_h) = self.restored_size;
         let mut output = vec![0u8; out_w as usize * out_h as usize * 3];
+        let mut frame = frame;
 
         // The tile ladder. Only an allocation failure is a capacity problem; a
         // missing model or a lost device is not improved by trying a smaller tile,
@@ -878,11 +918,24 @@ impl FrameSource {
             }
         }
 
-        Ok(Frame {
+        frame = Frame {
             data: output,
             width: out_w,
             height: out_h,
-        })
+        };
+
+        // And the target canvas, before interpolation rather than after it.
+        if let Some(resampler) = self.resampler.as_mut() {
+            let (canvas_w, canvas_h) = self.canvas;
+            let mut resized = vec![0u8; resampler.output_len()];
+            resampler.apply(&frame.data, &mut resized);
+            frame = Frame {
+                data: resized,
+                width: canvas_w,
+                height: canvas_h,
+            };
+        }
+        Ok(frame)
     }
 
     fn repeat_last(&mut self) -> Result<Frame> {

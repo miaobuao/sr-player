@@ -23,6 +23,7 @@
 pub mod grain;
 pub mod native;
 pub mod plan;
+pub mod resize;
 pub mod policy;
 pub mod profile;
 pub mod runner;
