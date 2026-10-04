@@ -203,6 +203,164 @@ pub fn shot_sigma(per_frame: &[GrainEstimate]) -> GrainEstimate {
     }
 }
 
+/// How the per-shot pass samples.
+#[derive(Clone, Copy, Debug)]
+pub struct GrainOptions {
+    /// Frames to measure per shot. Grain varies within a shot too, and the median
+    /// across a few frames is steadier than any single one.
+    pub frames_per_shot: usize,
+    /// A ceiling on frames read overall, so a film with thousands of shots cannot
+    /// turn a measurement into a second full decode.
+    pub max_frames: usize,
+}
+
+impl Default for GrainOptions {
+    fn default() -> Self {
+        GrainOptions {
+            frames_per_shot: 3,
+            max_frames: 600,
+        }
+    }
+}
+
+/// One shot's measurement, with where it came from.
+#[derive(Clone, Copy, Debug)]
+pub struct ShotGrain {
+    pub shot: usize,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub estimate: GrainEstimate,
+}
+
+/// Measures grain per shot, reading frames from the source at native resolution.
+///
+/// **Native resolution is not a detail.** The scene pass decodes a small raster
+/// because shot detection only needs structure, but scaling averages noise away:
+/// measuring grain on a downscaled frame reports a fraction of the truth, and the
+/// fraction depends on the scale factor rather than on the film. So this decodes
+/// full size and in gray, which is the least it can read per frame while still
+/// seeing the noise.
+///
+/// Frames are sampled across each shot rather than from its start, because the first
+/// frames of a shot are often a transition, and the samples are spread so that a
+/// shot whose grain changes part-way through does not report only one end of it.
+pub fn measure_shots(
+    ff: &crate::ffmpeg::Ffmpeg,
+    manifest: &crate::media::MediaManifest,
+    shots: &[crate::media::scene::Shot],
+    pre_chain: Option<&str>,
+    options: &GrainOptions,
+    reporter: &crate::Reporter,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<ShotGrain>, crate::error::Error> {
+    use crate::ffmpeg::{args, read_exact_or_eof, RunSpec, StreamingChild};
+    use crate::events::Stage;
+
+    let video = manifest
+        .primary_video()
+        .ok_or_else(|| crate::error::Error::Unsupported("no video stream".into()))?;
+    let (width, height) = video
+        .size()
+        .ok_or_else(|| crate::error::Error::Unsupported("unknown video dimensions".into()))?;
+    let (width, height) = (width as usize, height as usize);
+
+    // The frames each shot still wants, spread across it.
+    let mut wanted: Vec<Vec<u64>> = shots
+        .iter()
+        .map(|shot| {
+            let count = shot.frame_count();
+            let samples = options.frames_per_shot.min(count as usize).max(1);
+            (0..samples)
+                .map(|sample| {
+                    // Interior samples: a quarter in, three quarters in, and the
+                    // middle, which keeps transitions at the edges out of the
+                    // measurement.
+                    let fraction = (sample as f64 + 0.5) / samples as f64;
+                    // Skip the first and last frame of the shot.
+                    let usable = count.saturating_sub(2).max(1);
+                    shot.start_frame + 1 + (fraction * usable as f64) as u64
+                })
+                .map(|frame| frame.min(shot.end_frame.saturating_sub(1)))
+                .collect()
+        })
+        .collect();
+    let mut collected: Vec<Vec<GrainEstimate>> = vec![Vec::new(); shots.len()];
+
+    let mut filters = String::new();
+    if let Some(pre) = pre_chain.filter(|chain| !chain.is_empty()) {
+        filters.push_str(pre);
+        filters.push(',');
+    }
+    filters.push_str("format=gray");
+
+    let mut argv = args(&["-hide_banner", "-nostdin", "-progress", "pipe:1", "-i"]);
+    argv.push(manifest.path.display().to_string());
+    argv.extend(args(&[
+        "-map",
+        "0:v:0",
+        "-vf",
+        &filters,
+        "-an",
+        "-sn",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]));
+    let spec = RunSpec::new(Stage::Regrain, "grain-measure")
+        .stderr_level(crate::events::Level::Debug);
+    let mut child = StreamingChild::spawn(&ff.ffmpeg, &argv, reporter, &spec, false)?;
+    let mut stdout = child.stdout.take().ok_or_else(|| crate::error::Error::Stage {
+        stage: Stage::Regrain.id().into(),
+        detail: "ffmpeg produced no video pipe".into(),
+    })?;
+
+    let frame_bytes = width * height;
+    let mut buffer = vec![0u8; frame_bytes];
+    let mut frame_index: u64 = 0;
+    let mut read = 0usize;
+    while read < options.max_frames {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            child.kill();
+            return Err(crate::error::Error::Cancelled);
+        }
+        match read_exact_or_eof(&mut stdout, &mut buffer)? {
+            size if size < frame_bytes => break,
+            _ => {}
+        }
+        if let Some(shot) = shots
+            .iter()
+            .position(|shot| frame_index >= shot.start_frame && frame_index < shot.end_frame)
+        {
+            if let Some(at) = wanted[shot].iter().position(|frame| *frame == frame_index) {
+                wanted[shot].remove(at);
+                let luma: Vec<f32> = buffer.iter().map(|byte| *byte as f32 / 255.0).collect();
+                collected[shot].push(estimate_sigma(&luma, width, height));
+            }
+        }
+        frame_index += 1;
+        read += 1;
+        if wanted.iter().all(|frames| frames.is_empty()) {
+            break;
+        }
+    }
+    child.kill();
+
+    Ok(shots
+        .iter()
+        .enumerate()
+        .map(|(index, shot)| ShotGrain {
+            shot: index,
+            start_frame: shot.start_frame,
+            end_frame: shot.end_frame,
+            estimate: shot_sigma(&collected[index]),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +497,87 @@ mod tests {
         assert_eq!(estimate.samples, 0);
         assert_eq!(estimate.confidence, 0.0);
         assert!(!estimate.is_worth_applying());
+    }
+
+    /// The whole pass, on a file: two shots whose grain differs by a known factor
+    /// must come back labelled with the right amplitudes.
+    ///
+    /// This is the part that a unit test cannot check — decoding at native
+    /// resolution, deciding which shot a frame belongs to, and keeping the two
+    /// measurements apart. The fixture is built by adding noise to a mid-grey
+    /// picture, so the amplitude that goes in is the amplitude the estimator should
+    /// report.
+    #[test]
+    fn two_shots_with_different_grain_are_measured_separately() {
+        use crate::ffmpeg::{args, capture, Ffmpeg};
+        let Ok(ff) = Ffmpeg::discover() else {
+            eprintln!("SKIPPED: no FFmpeg");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("grain.mkv");
+        // Two seconds of quiet grain, then two of heavy grain, with a hard cut.
+        let mut argv = args(&[
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=gray:size=160x120:rate=24:duration=2",
+            // A different level in the second shot. Two patches of the same grey
+            // differing only in noise are not a cut the detector should report, and
+            // the first version of this fixture proved it does not.
+            "-f", "lavfi", "-i", "color=0x303030:size=160x120:rate=24:duration=2",
+            "-filter_complex",
+            "[0:v]noise=alls=6:allf=t+u[a];[1:v]noise=alls=24:allf=t+u[b];[a][b]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv420p",
+            "-f", "matroska",
+        ]);
+        argv.push(input.display().to_string());
+        capture(&ff.ffmpeg, &argv).expect("build the fixture");
+
+        let manifest = crate::media::probe(&ff, &input).expect("probe");
+        let bus = crate::EventBus::new();
+        let reporter = crate::Reporter::new(bus);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let scenes = crate::media::scene::detect_scenes(
+            &ff,
+            &manifest,
+            &reporter,
+            &cancel,
+            &crate::media::scene::SceneOptions::default(),
+            crate::media::scene::SceneDecode::raw(
+                manifest.primary_video().and_then(|v| v.fps()).expect("fps"),
+            ),
+        )
+        .expect("scenes");
+        assert!(
+            scenes.shots.len() >= 2,
+            "the fixture has a hard cut and must be found as two shots, got {}",
+            scenes.shots.len()
+        );
+
+        let measured = measure_shots(
+            &ff,
+            &manifest,
+            &scenes.shots,
+            None,
+            &GrainOptions::default(),
+            &reporter,
+            &cancel,
+        )
+        .expect("measure");
+        let described: Vec<String> = measured
+            .iter()
+            .map(|shot| format!("shot {} {}", shot.shot, shot.estimate.describe()))
+            .collect();
+        eprintln!("{}", described.join("\n"));
+
+        let first = measured.first().expect("a shot").estimate.sigma;
+        let last = measured.last().expect("a shot").estimate.sigma;
+        assert!(
+            first > 0.001,
+            "the quiet shot still has grain and must not measure as clean: {first}"
+        );
+        assert!(
+            last > first * 1.8,
+            "the heavy shot must measure far above the quiet one: {first:.4} vs {last:.4}"
+        );
     }
 }
