@@ -19,9 +19,11 @@ use std::collections::HashMap;
 
 /// The operator kernels.
 ///
-/// Every buffer is planar in the same layout the CPU reference uses —
+/// Every buffer uses the same interleaved layout as the CPU reference —
 /// `data[(y * width + x) * channels + channel]` — so a disagreement between the
-/// two is a disagreement about arithmetic rather than about memory order.
+/// two is a disagreement about arithmetic rather than about memory order. Getting
+/// that wrong once already: a channel is not a contiguous range in this layout,
+/// which is why concatenation is a shader and not a buffer copy.
 pub const SHADER: &str = r#"
 struct Params {
     width: u32,
@@ -124,12 +126,37 @@ fn add(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= count) {
         return;
     }
-    let plane = params.width * params.height;
     if (params.in_ch == params.out_ch) {
         output[id.x] = input[id.x] + aux[id.x];
     } else {
-        let pixel = id.x % plane;
+        // The layout is interleaved, so the pixel a channel belongs to is
+        // `index / channels`, not `index % plane`: with three channels the second
+        // form wraps every pixel and reads the wrong plane for most of them.
+        let pixel = id.x / params.out_ch;
         output[id.x] = input[id.x] + aux[pixel];
+    }
+}
+
+// Concatenation along channels, two operands at a time.
+//
+// This cannot be a buffer copy: the layout is interleaved, so one channel of a
+// frame is not a contiguous range and `copy_buffer_to_buffer` would move quarter
+// slices of the wrong pixels. A pair at a time is enough — the graph runner folds
+// longer concatenations into pairs — and it keeps the binding count fixed.
+@compute @workgroup_size(64, 1, 1)
+fn concat(@builtin(global_invocation_id) id: vec3<u32>) {
+    let count = params.width * params.height * params.out_ch;
+    if (id.x >= count) {
+        return;
+    }
+    let first_ch = params.in_ch;
+    let second_ch = params.out_ch - first_ch;
+    let pixel = id.x / params.out_ch;
+    let channel = id.x % params.out_ch;
+    if (channel < first_ch) {
+        output[id.x] = input[pixel * first_ch + channel];
+    } else {
+        output[id.x] = aux[pixel * second_ch + (channel - first_ch)];
     }
 }
 "#;
@@ -173,6 +200,7 @@ pub struct GpuOps {
     prelu: wgpu::ComputePipeline,
     warp: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
+    concat: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -223,6 +251,7 @@ impl GpuOps {
         let prelu = pipeline("prelu");
         let warp = pipeline("warp");
         let add = pipeline("add");
+        let concat = pipeline("concat");
         Ok(GpuOps {
             device,
             queue,
@@ -230,6 +259,7 @@ impl GpuOps {
             prelu,
             warp,
             add,
+            concat,
         })
     }
 
@@ -329,27 +359,38 @@ impl GpuOps {
                         .first()
                         .map(|(_, shape)| *shape)
                         .ok_or_else(|| ModelError::Shape("empty concat".into()))?;
-                    let channels: usize = frames.iter().map(|(_, shape)| shape.2).sum();
-                    let output = self.empty(width * height * channels);
-                    let mut offset = 0u64;
-                    for (buffer, shape) in &frames {
+                    for (_, shape) in &frames {
                         if shape.0 != width || shape.1 != height {
                             return Err(ModelError::Shape("concat of different sizes".into()));
                         }
-                        let plane = (width * height) as u64 * 4;
-                        for channel in 0..shape.2 {
-                            encoder.copy_buffer_to_buffer(
-                                buffer,
-                                channel as u64 * plane,
-                                &output,
-                                offset + channel as u64 * plane,
-                                plane,
-                            );
-                        }
-                        offset += shape.2 as u64 * plane;
                     }
-                    blobs.insert(top.clone(), output);
-                    shapes.insert(top, (width, height, channels));
+                    // Folded pairwise, because the kernel takes two operands and a
+                    // fixed binding count is worth more than a general one here.
+                    let mut accumulated = frames[0].clone();
+                    for (buffer, shape) in frames.iter().skip(1) {
+                        let channels = accumulated.1 .2 + shape.2;
+                        let output = self.empty(width * height * channels);
+                        let params = self.uniform(Params::new(
+                            width,
+                            height,
+                            accumulated.1 .2,
+                            channels,
+                            1.0,
+                        ));
+                        self.dispatch_pair(
+                            &mut encoder,
+                            &self.concat,
+                            "concat",
+                            &accumulated.0,
+                            buffer,
+                            &output,
+                            &params,
+                            width * height * channels,
+                        );
+                        accumulated = (output, (width, height, channels));
+                    }
+                    blobs.insert(top.clone(), accumulated.0);
+                    shapes.insert(top, accumulated.1);
                 }
                 "Convolution" => {
                     let (input, (width, height, in_ch)) = bottom(0)?;
@@ -486,37 +527,16 @@ impl GpuOps {
                         channels,
                         1.0,
                     ));
-                    let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("add"),
-                        layout: &self.add.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: input.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: other.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: output.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: params.as_entire_binding(),
-                            },
-                        ],
-                    });
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("add"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&self.add);
-                    pass.set_bind_group(0, &group, &[]);
-                    let count = (width * height * channels) as u32;
-                    pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
-                    drop(pass);
+                    self.dispatch_pair(
+                        &mut encoder,
+                        &self.add,
+                        "add",
+                        &input,
+                        &other,
+                        &output,
+                        &params,
+                        width * height * channels,
+                    );
                     blobs.insert(top.clone(), output);
                     shapes.insert(top, (width, height, channels));
                 }
@@ -593,6 +613,52 @@ impl GpuOps {
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             })
+    }
+
+    /// One dispatch of a kernel that takes two storage inputs: the binding order
+    /// is the same for `add` and `concat`, so they share this.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_pair(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        label: &str,
+        first: &wgpu::Buffer,
+        second: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+        count: usize,
+    ) {
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: first.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: second.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups((count as u32).div_ceil(64), 1, 1);
+        drop(pass);
     }
 
     fn dispatch_conv(
@@ -773,22 +839,13 @@ mod tests {
     /// property a wrong warp, a wrong sign or a mis-ordered concat destroys, and
     /// it is checkable without a checkpoint.
     ///
-    /// **This fails, and the failure is characterised rather than papered over.**
-    /// The device's answer is the *warped first frame*, not the average of the two:
-    /// the worst difference is 0.25550002, which is the 0.25 between the frames
-    /// plus the ~0.0055 of one pixel's gradient, i.e. the output is `warpa` with a
-    /// small spatial offset. So the second half of the concatenation contributes
-    /// nothing on the device. The CPU reference gets the same graph exactly right
-    /// (`ifnet::tests::a_rife_shaped_graph_with_a_zero_flow_head_is_exactly_a_blend`),
-    /// so the fault is in this module's buffer plumbing — the concat copy, the
-    /// fusion's second operand, or the read of it.
-    ///
-    /// It is ignored rather than deleted or loosened: the value is deterministic,
-    /// which means it is findable, and a test that asserted the wrong number would
-    /// hide it.
+    /// This is the test that found the layout bug: it failed with a difference of
+    /// 0.25550002, which is the 0.25 between the two frames plus one pixel of
+    /// gradient, so the answer was one warped frame rather than their average. The
+    /// cause was concatenation being a buffer copy — a channel is not a contiguous
+    /// range in an interleaved layout, so the copy moved the wrong bytes and the
+    /// fusion's second operand was never the second frame.
     #[test]
-    #[ignore = "the device's graph returns one warped frame instead of the average; the concat's \
-                second half is not reaching the fusion — see the comment above"]
     fn a_rife_shaped_graph_on_the_device_is_a_blend_when_the_flow_is_zero() {
         let Some(ops) = ops_or_skip() else {
             return;
