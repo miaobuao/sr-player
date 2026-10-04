@@ -44,6 +44,9 @@ pub struct RunnerOptions {
     /// Stop after the plan is produced, without touching any pixels.
     pub dry_run: bool,
     pub max_degrade_retries: u32,
+    /// Retries for a chunk failure that is not about capacity. One is enough for a
+    /// hiccup; more would turn a persistent fault into a slow failure.
+    pub max_chunk_retries: u32,
     /// How the native executor stores its per-chunk checkpoints.
     pub chunk_encoding: ChunkEncoding,
 }
@@ -55,6 +58,7 @@ impl Default for RunnerOptions {
             keep_intermediates: false,
             dry_run: false,
             max_degrade_retries: 4,
+            max_chunk_retries: 1,
             // FFV1 intermediates: one encode at the end, so the published file
             // cannot depend on where the chunk boundaries happened to fall.
             chunk_encoding: ChunkEncoding::LosslessIntermediate,
@@ -948,6 +952,7 @@ impl PipelineRunner {
             working: plan.working_set.clone(),
             chunk_encoding: options.chunk_encoding,
             max_degrade_retries: options.max_degrade_retries,
+            max_chunk_retries: options.max_chunk_retries,
             workdir: scratch,
         };
         let outcome = executor.run(&context)?;

@@ -202,6 +202,7 @@ fn the_engine_runs_the_vulkan_backend_over_a_real_file() {
                 // against, without an encoder's decisions in between.
                 keep_intermediates: true,
                 dry_run: false,
+                max_chunk_retries: 1,
                 max_degrade_retries: 2,
                 chunk_encoding: ChunkEncoding::LosslessIntermediate,
             },

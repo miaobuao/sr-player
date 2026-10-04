@@ -124,6 +124,8 @@ pub struct NativeContext<'a> {
     pub working: WorkingSet,
     pub chunk_encoding: ChunkEncoding,
     pub max_degrade_retries: u32,
+    /// Retries for a chunk failure that is not about capacity.
+    pub max_chunk_retries: u32,
     /// Directory for chunk files; created if missing.
     pub workdir: &'a Path,
 }
@@ -652,6 +654,28 @@ impl<'a> NativeExecutor<'a> {
                         }
                         None => return Err(err),
                     }
+                }
+                // A failure that is not about capacity is the driver hiccup, the
+                // device-lost, the backend that stumbled once. Retrying the same call
+                // is what makes an unattended run survive it: without this, one
+                // transient error in one chunk ends a job that may be hours long, and
+                // the resume machinery only helps if somebody notices and runs it
+                // again. Bounded, and never on cancellation — the operator asking to
+                // stop is not a hiccup.
+                Err(err)
+                    if attempt < ctx.max_chunk_retries
+                        && !matches!(err, Error::Cancelled) =>
+                {
+                    attempt += 1;
+                    ctx.reporter.warn(
+                        Some(Stage::Interpolate),
+                        format!(
+                            "chunk {chunk_index} failed ({err}); retrying, attempt \
+                             {attempt} of {}",
+                            ctx.max_chunk_retries
+                        ),
+                    );
+                    continue;
                 }
                 Err(err) => return Err(err),
             }

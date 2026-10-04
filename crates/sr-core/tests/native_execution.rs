@@ -228,7 +228,8 @@ fn a_model_backend_executes_the_frames_and_never_sees_a_cut() {
         resume: true,
         keep_intermediates: true,
         dry_run: false,
-        max_degrade_retries: 4,
+        max_chunk_retries: 1,
+                max_degrade_retries: 4,
         chunk_encoding: ChunkEncoding::LosslessIntermediate,
     };
     let outcome = runner

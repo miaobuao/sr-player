@@ -166,6 +166,9 @@ pub struct Session {
     /// one session rather than to the whole process — a process-wide switch would
     /// make the engine's own tests interfere with each other.
     pub fake_oom: u32,
+    /// A chunk to fail once, to exercise the engine's chunk-level retry.
+    pub fail_once_chunk: Option<u64>,
+    pub fail_once_served: bool,
     pub oom_served: u32,
     /// Kept alive because `last_error` pointers are handed out.
     _model_name: CString,
@@ -311,6 +314,7 @@ pub unsafe extern "C" fn sr_infer_open(
         let _model_name = cstring(model.clone());
         let config = unsafe { opt_cstr(desc.config_json) }.unwrap_or_default();
         let fake_oom = json_u32(&config, "fake_oom").unwrap_or(0);
+        let fail_once_chunk = json_u32(&config, "fail_once_chunk").map(|value| value as u64);
         let session = Box::new(Session {
             device_index: 0,
             model,
@@ -319,6 +323,8 @@ pub unsafe extern "C" fn sr_infer_open(
             frames_out: 0,
             last_error: cstring(""),
             fake_oom,
+            fail_once_chunk,
+            fail_once_served: false,
             oom_served: 0,
             _model_name,
         });
@@ -441,6 +447,19 @@ pub unsafe extern "C" fn sr_infer_execute(
                 SR_ERR_OUT_OF_MEMORY,
                 "injected out-of-memory fault (config_json: fake_oom)",
             );
+        }
+
+        // A hard, *one-shot* failure for one chunk. Out-of-memory is told to degrade
+        // and try again; this is the other kind — the driver hiccup that has nothing
+        // to do with capacity — and it is what a chunk-level retry has to survive.
+        // One-shot because a retry that always fails proves nothing about retrying.
+        if session.fail_once_chunk == Some(job.chunk_id) && !session.fail_once_served {
+            session.fail_once_served = true;
+            let message = format!(
+                "injected one-shot failure for chunk {} (config_json: fail_once_chunk)",
+                job.chunk_id
+            );
+            return set_error(session, SR_ERR_RUNTIME, &message);
         }
 
         if (job.struct_size as usize) < std::mem::size_of::<SrInferJob>() {
