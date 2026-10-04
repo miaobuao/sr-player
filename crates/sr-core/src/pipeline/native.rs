@@ -355,27 +355,65 @@ impl<'a> NativeExecutor<'a> {
             _ => (None, 1, 0),
         };
 
-        // The model emits source x scale; the deliverable is the canvas. Rather than
-        // let the encoder's filter chain do that after interpolation, it is done here
-        // so nothing resamples a synthesised frame.
-        let resampler = match restorer.is_some() && (model_size.0, model_size.1) != (width, height) {
+        // ---- how big the model's input should be ------------------------------
+        //
+        // The model is fixed at `scale` and the deliverable is the canvas, so the
+        // input that lands exactly on the canvas is `canvas / scale`. Feeding it
+        // more than that and throwing the surplus away in a downscale is the single
+        // most expensive thing this pipeline can do: a 720x480 source restored at 4x
+        // and downscaled to a 1620x1080 canvas costs 4x the model work of restoring
+        // at 405x270, and the canvas is what the file will contain either way.
+        //
+        // The source is only ever reduced, never enlarged: a source smaller than the
+        // ideal input is handed over as-is, because inventing pixels before the model
+        // sees them would be the resampler doing restoration's job.
+        //
+        // Rounded down to even so the chroma-free RGB path stays aligned and the
+        // geometry is stable frame to frame.
+        let even = |value: u32| value.max(2) & !1u32;
+        let (model_w, model_h) = if restorer.is_some() {
+            (
+                even(model_size.0 / scale.max(1) as u32).min(width),
+                even(model_size.1 / scale.max(1) as u32).min(height),
+            )
+        } else {
+            (width, height)
+        };
+        let restored = (
+            model_w.saturating_mul(scale.max(1) as u32),
+            model_h.saturating_mul(scale.max(1) as u32),
+        );
+
+        // Source -> what the model wants. `None` when they already agree, which is
+        // the case with no model in the path.
+        let pre_resampler = match restorer.is_some() && (model_w, model_h) != (width, height) {
             true => Some(crate::pipeline::resize::Resampler::new(
-                (width * scale.max(1) as u32) as usize,
-                (height * scale.max(1) as u32) as usize,
+                width as usize,
+                height as usize,
+                model_w as usize,
+                model_h as usize,
+            )),
+            false => None,
+        };
+        // What the model produced -> the canvas. Only needed when the source was too
+        // small to fill the ideal input; otherwise `restored` already *is* the
+        // canvas and nothing resamples a synthesised frame.
+        let post_resampler = match restorer.is_some() && restored != model_size {
+            true => Some(crate::pipeline::resize::Resampler::new(
+                restored.0 as usize,
+                restored.1 as usize,
                 model_size.0 as usize,
                 model_size.1 as usize,
             )),
             false => None,
         };
-        if let Some(_) = &resampler {
+
+        if restorer.is_some() {
             ctx.reporter.info(
                 Some(Stage::Restore),
                 format!(
-                    "target canvas: {}x{} -> {}x{}, resampled before interpolation so the model's \
-                     output is never resampled after it",
-                    width * scale.max(1) as u32,
-                    height * scale.max(1) as u32,
-                    model_size.0,
+                    "restoration geometry: source {}x{} -> model {}x{} -> restored {}x{} -> canvas {}x{}",
+                    width, height, model_w, model_h, restored.0, restored.1, model_size.0,
                     model_size.1
                 ),
             );
@@ -389,8 +427,10 @@ impl<'a> NativeExecutor<'a> {
             restorer,
             scale,
             tile,
-            (width * scale.max(1) as u32, height * scale.max(1) as u32),
-            resampler,
+            (model_w, model_h),
+            restored,
+            pre_resampler,
+            post_resampler,
             model_size,
         );
         let existing = self.committed_chunks(ctx.job_id)?;
@@ -769,14 +809,16 @@ struct FrameSource {
     scale: i32,
     /// Tile edge in pixels; 0 lets the runtime choose.
     tile: i32,
-    /// The geometry once the model has run: the source raster times the scale.
+    /// What the model is given, after any pre-resample.
+    model_input: (u32, u32),
+    /// The geometry once the model has run: `model_input` times the scale.
     restored_size: (u32, u32),
-    /// Brings the model's output to the target canvas before anything else sees it.
-    /// `None` when no model ran, in which case the decoder's raster is already what
-    /// the encoder expects and there is nothing to resample.
-    resampler: Option<crate::pipeline::resize::Resampler>,
-    /// What the resampler produces, kept alongside it so a frame can be labelled
-    /// without asking the resampler what it does.
+    /// Source raster -> what the model wants. `None` when they already agree.
+    pre_resampler: Option<crate::pipeline::resize::Resampler>,
+    /// Model output -> the canvas. `None` when the model already landed on it, which
+    /// is the usual case and the one worth arranging for.
+    post_resampler: Option<crate::pipeline::resize::Resampler>,
+    /// The canvas, kept so a frame can be labelled without asking a resampler.
     canvas: (u32, u32),
 }
 
@@ -789,8 +831,10 @@ impl FrameSource {
         restorer: Option<ai::Restorer>,
         scale: i32,
         tile: i32,
+        model_input: (u32, u32),
         restored_size: (u32, u32),
-        resampler: Option<crate::pipeline::resize::Resampler>,
+        pre_resampler: Option<crate::pipeline::resize::Resampler>,
+        post_resampler: Option<crate::pipeline::resize::Resampler>,
         canvas: (u32, u32),
     ) -> Self {
         FrameSource {
@@ -807,8 +851,10 @@ impl FrameSource {
             restorer,
             scale,
             tile,
+            model_input,
             restored_size,
-            resampler,
+            pre_resampler,
+            post_resampler,
             canvas,
         }
     }
@@ -864,6 +910,16 @@ impl FrameSource {
     /// segment kind -- hold, pass and synthesise -- gets them without knowing the
     /// model exists.
     fn restore(&mut self, mut frame: Frame) -> Result<Frame> {
+        if let Some(pre) = self.pre_resampler.as_mut() {
+            let mut reduced = vec![0u8; pre.output_len()];
+            pre.apply(&frame.data, &mut reduced);
+            let (w, h) = self.model_input;
+            frame = Frame {
+                data: reduced,
+                width: w,
+                height: h,
+            };
+        }
         let Some(restorer) = self.restorer.as_mut() else {
             return Ok(frame);
         };
@@ -925,7 +981,7 @@ impl FrameSource {
         };
 
         // And the target canvas, before interpolation rather than after it.
-        if let Some(resampler) = self.resampler.as_mut() {
+        if let Some(resampler) = self.post_resampler.as_mut() {
             let (canvas_w, canvas_h) = self.canvas;
             let mut resized = vec![0u8; resampler.output_len()];
             resampler.apply(&frame.data, &mut resized);
