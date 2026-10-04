@@ -1168,6 +1168,49 @@ mod tests {
         assert!(odd.note.contains("hexagonal"), "{}", odd.note);
     }
 
+    /// Do the three bands sum back to the signal they came from?
+    ///
+    /// Everything the duck does depends on this. Subtracting a scaled copy of the mid
+    /// band attenuates only when the bands are complementary, and scaling a band and
+    /// summing the bands back is exact only under the same condition — measured, the
+    /// second form overshoots a pure in-band tone by 17%, which no crossover ripple
+    /// explains.
+    ///
+    /// This prints the ratio per frequency so the shape of the error is visible rather
+    /// than asserting a bound, and only fails if the reconstruction is wildly wrong.
+    #[test]
+    fn the_three_bands_measured_against_their_input() {
+        use crate::audio::dsp::ThreeBandSplitter;
+        let rate = 48_000u32;
+        let mut splitter = ThreeBandSplitter::new(rate, 300.0, 6_000.0);
+        let (mut low, mut mid, mut high) = (Vec::new(), Vec::new(), Vec::new());
+        for frequency in [
+            100.0f64, 200.0, 300.0, 400.0, 1_000.0, 3_000.0, 6_000.0, 12_000.0,
+        ] {
+            let n = rate as usize / 2;
+            let input: Vec<f32> = (0..n)
+                .map(|i| {
+                    (0.5 * (2.0 * std::f64::consts::PI * frequency * i as f64 / rate as f64).sin())
+                        as f32
+                })
+                .collect();
+            splitter.split(&input, &mut low, &mut mid, &mut high);
+            // Skip the first 100 ms so the filter state has settled.
+            let from = rate as usize / 10;
+            let rms = |values: &[f32]| -> f64 {
+                let sum: f64 = values[from..].iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                (sum / (values.len() - from) as f64).sqrt()
+            };
+            let reference = rms(&input);
+            let summed: Vec<f32> = (0..n).map(|i| low[i] + mid[i] + high[i]).collect();
+            eprintln!(
+                "  {frequency:>7.0} Hz: input {reference:.5}, low+mid+high {:.5}, ratio {:.4}",
+                rms(&summed),
+                rms(&summed) / reference
+            );
+        }
+    }
+
     #[test]
     fn twelve_seconds_of_six_channels_stays_bounded() {
         // The pipeline runs a whole runtime in 100 ms blocks; unit tests here ran
