@@ -479,3 +479,4 @@ pub unsafe extern "C" fn sr_infer_execute(
         SR_OK
     })
 }
+pub mod ifnet_gpu;
