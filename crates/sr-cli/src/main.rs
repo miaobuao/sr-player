@@ -12,7 +12,8 @@ use sr_core::gpu;
 use sr_core::infer::EngineRegistry;
 use sr_core::media::classify::{classify, ClassifyOptions};
 use sr_core::media::probe;
-use sr_core::media::scene::{detect_scenes, SceneOptions};
+use sr_core::media::scene::{detect_scenes, SceneDecode, SceneOptions};
+use sr_core::pipeline::native::ChunkEncoding;
 use sr_core::pipeline::plan::PlanRequest;
 use sr_core::pipeline::profile::RestorationProfile;
 use sr_core::pipeline::runner::{PipelineRunner, RunnerOptions};
@@ -83,6 +84,11 @@ enum Command {
         /// off | duplicate | minterpolate | plugin
         #[arg(long)]
         interpolate: Option<String>,
+        /// How the native executor stores its per-chunk checkpoints:
+        /// ffv1 (lossless intermediates, one final encode) or direct (encode each
+        /// chunk with the final encoder and concatenate with a stream copy).
+        #[arg(long)]
+        chunk_encoding: Option<String>,
         /// Skip the audio remaster entirely (tracks are copied).
         #[arg(long)]
         no_audio: bool,
@@ -228,12 +234,18 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
                 &cancel,
                 &ClassifyOptions::default(),
             )?;
+            let cadence = sr_core::pipeline::plan::cadence_for(&manifest, &temporal)?;
             let scenes = detect_scenes(
                 &ff,
                 &manifest,
                 &reporter,
                 &cancel,
                 &SceneOptions::default(),
+                SceneDecode {
+                    pre_chain: cadence.chain_str(),
+                    fps: cadence.fps,
+                    reason: "decoded cadence, the same chain the encoder uses",
+                },
             )?;
             let audio = if manifest.audio.is_empty() {
                 None
@@ -284,6 +296,7 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             no_resume,
             keep_intermediates,
             interpolate,
+            chunk_encoding,
             no_audio,
             quality,
         } => {
@@ -342,6 +355,14 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
                 resume: !*no_resume,
                 keep_intermediates: *keep_intermediates,
                 dry_run: *dry_run,
+                chunk_encoding: match chunk_encoding {
+                    Some(text) => ChunkEncoding::parse(text).ok_or_else(|| {
+                        sr_core::Error::Other(format!(
+                            "unknown chunk encoding `{text}`: use ffv1 or direct"
+                        ))
+                    })?,
+                    None => ChunkEncoding::LosslessIntermediate,
+                },
                 ..Default::default()
             };
 

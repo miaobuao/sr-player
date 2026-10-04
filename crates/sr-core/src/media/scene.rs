@@ -506,6 +506,35 @@ pub fn build_shots(
     shots
 }
 
+/// Which stream the shot boundaries describe.
+///
+/// A shot list is only meaningful relative to a frame numbering. Analysing the
+/// *decoded* stream — after the same IVTC/deinterlace chain the encoder uses —
+/// is what makes [`Shot::start_frame`] mean "the Nth frame the model will see".
+/// On a 3:2 telecine source the raw and the decoded numbering differ by 20%, and
+/// a shot list that is off by 20% protects nothing.
+#[derive(Clone, Debug)]
+pub struct SceneDecode<'a> {
+    /// Filters applied before analysis. Must be the temporal chain the encode
+    /// path uses, or the frame indices will not line up with the model's input.
+    pub pre_chain: Option<&'a str>,
+    /// Frame rate after the pre-chain: inverse telecine changes it.
+    pub fps: Rational,
+    /// Why this chain was chosen, for the log.
+    pub reason: &'a str,
+}
+
+impl<'a> SceneDecode<'a> {
+    /// Analyses the file as stored. Correct when no cadence change is applied.
+    pub fn raw(fps: Rational) -> Self {
+        SceneDecode {
+            pre_chain: None,
+            fps,
+            reason: "as stored",
+        }
+    }
+}
+
 /// Decodes a small grayscale raster and runs the detector over it.
 pub fn detect_scenes(
     ff: &Ffmpeg,
@@ -513,13 +542,12 @@ pub fn detect_scenes(
     reporter: &Reporter,
     cancel: &AtomicBool,
     opts: &SceneOptions,
+    decode: SceneDecode<'_>,
 ) -> Result<SceneReport> {
     let video = manifest
         .primary_video()
         .ok_or_else(|| Error::Unsupported("no video stream to analyse".into()))?;
-    let fps = video
-        .fps()
-        .ok_or_else(|| Error::Unsupported("unknown frame rate: cannot place shot boundaries".into()))?;
+    let fps = decode.fps;
     let tb = fps.inverse().unwrap_or(Rational::ONE);
 
     let (src_w, src_h) = video
@@ -531,7 +559,16 @@ pub fn detect_scenes(
     let analysis_h = (((src_h as f64 / src_w as f64) * analysis_w as f64).round() as usize).max(2);
     let analysis_h = if analysis_h % 2 == 1 { analysis_h + 1 } else { analysis_h };
 
-    let mut filters = format!("scale={analysis_w}:{analysis_h}:flags=fast_bilinear,format=gray");
+    let mut filters = String::new();
+    if let Some(pre) = decode.pre_chain.filter(|p| !p.is_empty()) {
+        // The cadence chain runs first so that shot indices count *decoded*
+        // frames.
+        filters.push_str(pre);
+        filters.push(',');
+    }
+    filters.push_str(&format!(
+        "scale={analysis_w}:{analysis_h}:flags=fast_bilinear,format=gray"
+    ));
     if opts.accurate_timestamps {
         filters.push_str(",showinfo");
     }
@@ -575,10 +612,15 @@ pub fn detect_scenes(
     reporter.info(
         Some(Stage::Scenes),
         format!(
-            "scanning {} frames at {analysis_w}x{analysis_h} gray{}",
+            "scanning {} frames at {analysis_w}x{analysis_h} gray ({}), cadence: {}{}",
             expected_frames
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".into()),
+            decode.reason,
+            match decode.pre_chain.filter(|p| !p.is_empty()) {
+                Some(chain) => chain,
+                None => "unchanged",
+            },
             if opts.accurate_timestamps {
                 " with real PTS"
             } else {

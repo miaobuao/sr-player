@@ -8,7 +8,7 @@
 use crate::audio::loudness::AudioAnalysis;
 use crate::error::Result;
 use crate::ffmpeg::{EncoderPreference, Ffmpeg, SelectedAudioEncoder, SelectedVideoEncoder, VideoCodec};
-use crate::infer::{EngineKind, EngineRegistry, InferenceTask};
+use crate::infer::{EngineKind, EngineRegistry, InferenceEngine, InferenceTask};
 use crate::media::classify::{TemporalMode, TemporalReport};
 use crate::media::manifest::{MediaManifest, PreservationInventory};
 use crate::media::scene::SceneReport;
@@ -19,6 +19,7 @@ use crate::pipeline::profile::{
 use crate::time::{Rational, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,19 +50,86 @@ pub struct InterpolationPlan {
     pub note: String,
 }
 
+/// Who turns input frames into output frames.
+///
+/// This is the field that keeps the engine honest: a plan that says
+/// [`VideoExecutor::NativeInference`] must be executed by pushing frames through
+/// a model session, and a plan that says [`VideoExecutor::FfmpegSinglePass`] must
+/// not claim a model ran. Before this existed, a plan could resolve to
+/// `InterpolationMethod::Plugin` and then be executed by `minterpolate`, which
+/// meant the log said "model interpolation" while FFmpeg did something else.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoExecutor {
+    /// One FFmpeg pass with a filter chain. Deterministic; no model involved.
+    FfmpegSinglePass,
+    /// The engine decodes frames, pushes them through a model session, and
+    /// encodes the result, shot by shot.
+    NativeInference,
+}
+
+impl VideoExecutor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VideoExecutor::FfmpegSinglePass => "ffmpeg-single-pass",
+            VideoExecutor::NativeInference => "native-inference",
+        }
+    }
+}
+
+/// What the model session will actually do, resolved before any pixel moves.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferencePlan {
+    pub engine_id: String,
+    /// `"restore"`, `"interpolate"`.
+    pub tasks: Vec<String>,
+    /// Frames handed to the model per call.
+    pub temporal_window: u32,
+    /// Frames per restore call.
+    pub max_batch: u32,
+    /// Geometry the model sees: square pixels at source resolution.
+    pub width: u32,
+    pub height: u32,
+    /// Geometry change the model applies, 1.0 = unchanged.
+    pub model_upscale: f64,
+    pub precision: Vec<String>,
+    pub model: String,
+    /// The backend accepts a smaller working set after an out-of-memory failure.
+    pub can_reconfigure: bool,
+    /// Restoration strength handed to the model.
+    pub restore_strength: f32,
+    pub note: String,
+}
+
+impl InferencePlan {
+    pub fn describes(&self, task: &str) -> bool {
+        self.tasks.iter().any(|t| t == task)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoPlan {
     pub source: VideoSourceInfo,
     pub temporal_mode: TemporalMode,
     pub temporal_note: String,
+    /// The cadence decision, shared by the analyser, the decoder and the model.
+    pub cadence: CadencePlan,
     pub ivtc: bool,
     pub deinterlace: Option<String>,
     pub target_width: u32,
     pub target_height: u32,
     pub upscale_factor: f32,
     pub interpolation: InterpolationPlan,
+    /// Who executes the video work, and therefore what the log may claim.
+    pub executor: VideoExecutor,
+    /// Present exactly when `executor` is [`VideoExecutor::NativeInference`].
+    pub inference: Option<InferencePlan>,
     pub regrain_strength: f32,
+    /// Filters FFmpeg applies on the encode side. For the native executor this is
+    /// the post-model chain only; the model is not an FFmpeg filter.
     pub filter_chain: String,
+    /// Filters FFmpeg applies on the decode side before the model sees a frame.
+    pub decode_chain: String,
     pub encoder: SelectedVideoEncoder,
     /// Every usable encoder, best first. The runner walks this list when an
     /// encoder turns out to be advertised but unusable (an AMD encoder on an
@@ -83,6 +151,25 @@ impl VideoPlan {
 
     pub fn input_args(&self) -> Vec<String> {
         self.encoder.input_args.clone()
+    }
+
+    /// True when the plan's video work must go through a model session.
+    pub fn uses_model(&self) -> bool {
+        self.executor == VideoExecutor::NativeInference
+    }
+
+    /// Frame rate of the raw frames the native executor pushes around.
+    ///
+    /// With a model interpolator the pipe already carries the target rate,
+    /// because the model produces the extra frames. Without one the pipe carries
+    /// the decoded rate and any frame-rate change happens in the post chain — so
+    /// declaring the target rate here would silently stretch the output.
+    pub fn pipe_fps(&self) -> Rational {
+        if self.interpolation.enabled && self.interpolation.method == InterpolationMethod::Plugin {
+            self.interpolation.target_fps
+        } else {
+            self.cadence.fps
+        }
     }
 }
 
@@ -231,6 +318,35 @@ impl ConversionPlan {
             ),
             ("cadence".into(), self.video.temporal_note.clone()),
             (
+                "executor".into(),
+                match (&self.video.executor, &self.video.inference) {
+                    (VideoExecutor::NativeInference, Some(inference)) => format!(
+                        "native inference · {} · {} · window {} · model {}",
+                        inference.engine_id,
+                        if inference.tasks.is_empty() {
+                            "no task".to_string()
+                        } else {
+                            inference.tasks.join(" + ")
+                        },
+                        inference.temporal_window,
+                        if inference.model.is_empty() {
+                            "unnamed".to_string()
+                        } else {
+                            inference.model.clone()
+                        }
+                    ),
+                    _ => "FFmpeg single pass (no model session)".to_string(),
+                },
+            ),
+            (
+                "decode filters".into(),
+                if self.video.decode_chain.is_empty() {
+                    "(none: frames reach the model as stored)".into()
+                } else {
+                    self.video.decode_chain.clone()
+                },
+            ),
+            (
                 "filters".into(),
                 if self.video.filter_chain.is_empty() {
                     "(none)".into()
@@ -259,11 +375,12 @@ impl ConversionPlan {
     /// One-line summary for the log header.
     pub fn describe(&self) -> String {
         format!(
-            "{}x{} @ {:.3} fps, {}, {}, {}",
+            "{}x{} @ {:.3} fps, {}, {}, {}, {}",
             self.video.target_width,
             self.video.target_height,
             self.video.interpolation.target_fps.to_f64(),
             self.video.encoder.describe(),
+            self.video.executor.as_str(),
             self.video.interpolation.method.as_str(),
             if self.audio.enabled {
                 "audio remaster"
@@ -297,80 +414,278 @@ pub fn choose_target(source_w: u64, source_h: u64, max_upscale: f32) -> (u32, u3
     (target_w as u32, target_h as u32)
 }
 
+/// The cadence decision, in one place: which filters run before anything else
+/// touches the picture, and what frame rate they leave behind.
+///
+/// This is the single source of truth for the temporal decision. The scene
+/// detector, the FFmpeg encode path and the native executor all build it from
+/// here, so shot indices, model input frames and encoded frames cannot drift
+/// apart — which is exactly the class of bug that produces a frame interpolated
+/// across a cut, or a shot boundary that protects the wrong frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CadencePlan {
+    pub chain: Option<String>,
+    /// Frame rate after `chain` has been applied.
+    pub fps: Rational,
+    /// Frame numbering changes: the source frame count is not the decoded one.
+    pub renumbers_frames: bool,
+    pub note: String,
+}
+
+impl CadencePlan {
+    pub fn plan(mode: TemporalMode, source_fps: Rational, confident: bool) -> Self {
+        let (chain, drops_frames, note) = match mode {
+            TemporalMode::Interlaced => (
+                Some("bwdif=mode=send_frame:parity=auto:deint=all".to_string()),
+                false,
+                "motion-adaptive deinterlace (no frame dropping)".to_string(),
+            ),
+            TemporalMode::Mixed => (
+                Some("bwdif=mode=send_frame:parity=auto:deint=interlaced".to_string()),
+                false,
+                "mixed cadence: deinterlace only the interlaced parts".to_string(),
+            ),
+            TemporalMode::Telecine => (
+                // Field match first, then remove the duplicated frames. A blanket
+                // deinterlace here would throw away half the temporal information.
+                Some("fieldmatch=order=auto:combmatch=full,decimate".to_string()),
+                true,
+                if confident {
+                    "3:2 pulldown removed (inverse telecine)".to_string()
+                } else {
+                    "cadence classifier was not confident; inverse telecine applied conservatively"
+                        .to_string()
+                },
+            ),
+            _ => (
+                None,
+                false,
+                "progressive or unknown cadence: frames are passed through untouched".to_string(),
+            ),
+        };
+        let fps = if drops_frames {
+            post_ivtc_fps(source_fps)
+        } else {
+            source_fps
+        };
+        CadencePlan {
+            chain,
+            fps,
+            renumbers_frames: drops_frames,
+            note,
+        }
+    }
+
+    pub fn chain_str(&self) -> Option<&str> {
+        self.chain.as_deref()
+    }
+
+    /// What the log should say about the cadence.
+    pub fn describe(&self, mode: TemporalMode) -> String {
+        format!(
+            "{} — {}{}",
+            mode.as_str(),
+            self.note,
+            if self.renumbers_frames {
+                format!("; decoded at {:.3} fps", self.fps.to_f64())
+            } else {
+                String::new()
+            }
+        )
+    }
+}
+
 /// Frame rate after inverse telecine: 3:2 pulldown collapses to 4/5 of the rate.
 pub fn post_ivtc_fps(fps: Rational) -> Rational {
     fps.checked_mul(&Rational::new(4, 5).unwrap_or(Rational::ONE))
         .unwrap_or(fps)
 }
 
-/// Builds the `-vf` chain. Order matters and is fixed.
+/// The cadence decision for a probed file.
+///
+/// Both the pipeline's scene analysis and its plan go through this, so the shot
+/// list and the encoder are guaranteed to be talking about the same frames.
+pub fn cadence_for(
+    manifest: &MediaManifest,
+    temporal: &TemporalReport,
+) -> Result<CadencePlan> {
+    let fps = manifest
+        .primary_video()
+        .and_then(|v| v.fps())
+        .ok_or_else(|| {
+            crate::error::Error::Unsupported("the video frame rate is unknown".into())
+        })?;
+    Ok(CadencePlan::plan(
+        temporal.mode,
+        fps,
+        temporal.mode.is_confident(),
+    ))
+}
+
+/// Geometry filters: the resize that turns a non-square-pixel raster into the
+/// target, or the upscale after a restoration model.
+fn geometry_filters(video: &VideoPlan, source_square: (u32, u32)) -> Vec<String> {
+    if (video.target_width, video.target_height) == source_square {
+        Vec::new()
+    } else {
+        vec![format!(
+            "scale={}:{}:flags=lanczos",
+            video.target_width, video.target_height
+        )]
+    }
+}
+
+/// Re-grain. Still an FFmpeg noise generator: the per-shot grain estimator that
+/// should drive it does not exist yet, which is why the plan only enables this
+/// when a profile asks for it explicitly.
+fn regrain_filter(video: &VideoPlan) -> Vec<String> {
+    if video.regrain_strength > 0.0 {
+        vec![format!(
+            "noise=alls={:.0}:allf=t+u",
+            video.regrain_strength.clamp(1.0, 30.0)
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn encoder_tail(video: &VideoPlan) -> Vec<String> {
+    if video.encoder.requires_hwupload {
+        vec![format!("format={},hwupload", video.encoder.pix_fmt)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Builds the `-vf` chain for the single-pass FFmpeg executor. Order matters and
+/// is fixed: cadence, geometry, interpolation, grain, encoder upload.
+///
+/// A plan whose interpolation is handled by a model never reaches this function
+/// with `InterpolationMethod::Plugin`: that combination is resolved into
+/// [`VideoExecutor::NativeInference`] instead. If it does arrive here anyway, no
+/// interpolation filter is emitted at all — quietly substituting `minterpolate`
+/// is exactly the failure this build removed.
 pub fn build_filter_chain(video: &VideoPlan, source_square: (u32, u32)) -> String {
     let mut filters: Vec<String> = Vec::new();
 
     if let Some(deinterlace) = &video.deinterlace {
         filters.push(deinterlace.clone());
     }
-
-    let needs_scale = (video.target_width, video.target_height) != source_square;
-    if needs_scale {
-        filters.push(format!(
-            "scale={}:{}:flags=lanczos",
-            video.target_width, video.target_height
-        ));
-    }
+    filters.extend(geometry_filters(video, source_square));
 
     let interpolation = &video.interpolation;
     if interpolation.enabled && interpolation.multiplier > 1 {
         let fps = format!("{:.6}", interpolation.target_fps.to_f64());
         match interpolation.method {
             InterpolationMethod::Duplicate => filters.push(format!("framerate=fps={fps}")),
-            InterpolationMethod::Minterpolate | InterpolationMethod::Plugin => {
+            InterpolationMethod::Minterpolate => {
                 // `scd=fdiff` keeps the interpolator from crossing a cut, which
-                // is the one artefact that is impossible to miss.
+                // is the one artefact that is impossible to miss. It is FFmpeg's
+                // own detector, not ours, which is why this engine is never used
+                // to satisfy a request for model interpolation.
                 filters.push(format!(
                     "minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
                 ));
             }
-            InterpolationMethod::Off => {}
+            // Unreachable through `build_plan`; see the doc comment.
+            InterpolationMethod::Plugin | InterpolationMethod::Off => {}
         }
     }
 
-    if video.regrain_strength > 0.0 {
+    filters.extend(regrain_filter(video));
+    filters.extend(encoder_tail(video));
+    filters.join(",")
+}
+
+/// The chain applied to frames *after* a model session produced them.
+///
+/// The model is not an FFmpeg filter, so it cannot appear here. What is left is
+/// the deterministic tail: an optional frame-rate change the model did not make,
+/// the final resize (Lanczos, because no model invented the pixels at that size),
+/// re-grain and the encoder upload.
+pub fn build_post_chain(video: &VideoPlan, model_output: (u32, u32)) -> String {
+    let mut filters: Vec<String> = Vec::new();
+    let interpolation = &video.interpolation;
+    if interpolation.enabled
+        && interpolation.multiplier > 1
+        && interpolation.method != InterpolationMethod::Plugin
+    {
+        // The model did not synthesise these frames, so FFmpeg has to: this is
+        // frame duplication, and it is labelled as such in the plan.
         filters.push(format!(
-            "noise=alls={:.0}:allf=t+u",
-            video.regrain_strength.clamp(1.0, 30.0)
+            "framerate=fps={:.6}",
+            interpolation.target_fps.to_f64()
         ));
     }
-
-    if video.encoder.requires_hwupload {
-        filters.push(format!("format={},hwupload", video.encoder.pix_fmt));
+    if (video.target_width, video.target_height) != model_output {
+        filters.push(format!(
+            "scale={}:{}:flags=lanczos",
+            video.target_width, video.target_height
+        ));
     }
-
+    filters.extend(regrain_filter(video));
+    filters.extend(encoder_tail(video));
     filters.join(",")
+}
+
+/// The chain applied before the model sees a frame: cadence only, at source
+/// resolution, so the model works on the picture rather than on a resample of it.
+pub fn build_decode_chain(video: &VideoPlan) -> String {
+    video
+        .cadence
+        .chain
+        .clone()
+        .unwrap_or_else(String::new)
+}
+
+/// Geometry the model hands back: its input size scaled by what it says it does
+/// to geometry. Encoders reject odd widths, so the result is rounded up to even.
+pub fn model_output_geometry(inference: Option<&InferencePlan>) -> (u32, u32) {
+    let even = |value: f64| -> u32 {
+        let rounded = value.round().max(2.0) as u32;
+        if rounded % 2 == 1 {
+            rounded + 1
+        } else {
+            rounded
+        }
+    };
+    match inference {
+        Some(inference) => (
+            even(inference.width as f64 * inference.model_upscale),
+            even(inference.height as f64 * inference.model_upscale),
+        ),
+        None => (0, 0),
+    }
 }
 
 /// Chooses the interpolation engine actually used, downgrading honestly when the
 /// requested one is not installed.
+///
+/// Returns the plan together with the engine that must execute it, so the caller
+/// can pick a real executor instead of assuming the FFmpeg path will do.
 fn resolve_interpolation(
     profile: &RestorationProfile,
     engines: &EngineRegistry,
     ff: &Ffmpeg,
     source_fps: Rational,
     warnings: &mut Vec<String>,
-) -> InterpolationPlan {
+) -> (InterpolationPlan, Option<Arc<dyn InferenceEngine>>) {
     let multiplier = profile.interpolation.multiplier.max(1);
     let requested = profile.interpolation.method;
     if requested == InterpolationMethod::Off || multiplier <= 1 {
-        return InterpolationPlan {
-            enabled: false,
-            method: InterpolationMethod::Off,
-            source_fps,
-            target_fps: source_fps,
-            multiplier: 1,
-            engine: None,
-            scene_cuts_respected: true,
-            note: "interpolation disabled: source cadence preserved".into(),
-        };
+        return (
+            InterpolationPlan {
+                enabled: false,
+                method: InterpolationMethod::Off,
+                source_fps,
+                target_fps: source_fps,
+                multiplier: 1,
+                engine: None,
+                scene_cuts_respected: true,
+                note: "interpolation disabled: source cadence preserved".into(),
+            },
+            None,
+        );
     }
 
     let post_ivtc = source_fps;
@@ -378,23 +693,31 @@ fn resolve_interpolation(
         .checked_mul(&Rational::from_i64(multiplier as i64))
         .unwrap_or(post_ivtc);
 
-    let (method, engine, note) = match requested {
+    let (method, engine_id, note, selected) = match requested {
         InterpolationMethod::Plugin => match engines.select(InferenceTask::Interpolate) {
-            Some(engine) if engine.kind() == EngineKind::Plugin => (
-                InterpolationMethod::Plugin,
-                Some(engine.id().to_string()),
-                "model interpolation via the installed plugin".to_string(),
-            ),
+            Some(engine) if engine.kind() == EngineKind::Plugin => {
+                let note = format!(
+                    "model interpolation via {} (native executor, shots processed separately)",
+                    engine.display_name()
+                );
+                (
+                    InterpolationMethod::Plugin,
+                    Some(engine.id().to_string()),
+                    note,
+                    Some(engine),
+                )
+            }
             _ => {
                 warnings.push(
-                    "no interpolation plugin installed: falling back to frame duplication \
-                     (no motion is synthesised)"
+                    "no interpolation plugin is installed: the requested model interpolation \
+                     cannot run, so frames are duplicated instead (no motion is synthesised)"
                         .into(),
                 );
                 (
                     InterpolationMethod::Duplicate,
                     None,
                     "frame duplication (no model backend available)".to_string(),
+                    None,
                 )
             }
         },
@@ -404,6 +727,7 @@ fn resolve_interpolation(
                     InterpolationMethod::Minterpolate,
                     Some("ffmpeg-minterpolate".to_string()),
                     "motion-compensated interpolation in software; expect a large slowdown".into(),
+                    None,
                 )
             } else {
                 warnings.push("minterpolate filter missing: using frame duplication".into());
@@ -411,6 +735,7 @@ fn resolve_interpolation(
                     InterpolationMethod::Duplicate,
                     None,
                     "frame duplication (minterpolate unavailable)".to_string(),
+                    None,
                 )
             }
         }
@@ -418,24 +743,28 @@ fn resolve_interpolation(
             InterpolationMethod::Duplicate,
             None,
             "frame duplication: deterministic, invents no motion".to_string(),
+            None,
         ),
     };
 
-    InterpolationPlan {
-        enabled: true,
-        method,
-        source_fps: post_ivtc,
-        target_fps,
-        multiplier,
-        engine,
-        scene_cuts_respected: profile.interpolation.scene_cut_protection,
-        note: format!(
-            "{note}; {}x {:.3} -> {:.3} fps",
+    (
+        InterpolationPlan {
+            enabled: true,
+            method,
+            source_fps: post_ivtc,
+            target_fps,
             multiplier,
-            post_ivtc.to_f64(),
-            target_fps.to_f64()
-        ),
-    }
+            engine: engine_id,
+            scene_cuts_respected: profile.interpolation.scene_cut_protection,
+            note: format!(
+                "{note}; {}x {:.3} -> {:.3} fps",
+                multiplier,
+                post_ivtc.to_f64(),
+                target_fps.to_f64()
+            ),
+        },
+        selected,
+    )
 }
 
 /// The whole decision, in one place.
@@ -463,39 +792,17 @@ pub fn build_plan(
     let duration_seconds = manifest.duration_seconds();
 
     // --- temporal -----------------------------------------------------------
+    let cadence = cadence_for(manifest, temporal)?;
     let ivtc = temporal.mode.needs_ivtc();
-    let deinterlace = match temporal.mode {
-        TemporalMode::Interlaced => Some(
-            "bwdif=mode=send_frame:parity=auto:deint=all".to_string(),
-        ),
-        TemporalMode::Mixed => Some(
-            "bwdif=mode=send_frame:parity=auto:deint=interlaced".to_string(),
-        ),
-        _ => None,
-    };
-    let temporal_filter = if ivtc {
-        // Field match first, then remove the duplicated frames. A blanket
-        // deinterlace here would throw away half the temporal information.
-        if !temporal.mode.is_confident() {
-            warnings.push("cadence classifier was not confident; IVTC applied conservatively".into());
-        }
-        Some("fieldmatch=order=auto:combmatch=full,decimate".to_string())
-    } else {
-        None
-    };
-    let effective_fps = if ivtc { post_ivtc_fps(fps) } else { fps };
-    let temporal_note = format!(
-        "{} — {}{}",
-        temporal.mode.as_str(),
-        temporal.summary(),
-        if ivtc {
-            format!("; IVTC to {:.3} fps", effective_fps.to_f64())
-        } else if temporal.mode.needs_deinterlace() {
-            "; motion-adaptive deinterlace (no frame dropping)".to_string()
-        } else {
-            String::new()
-        }
-    );
+    let deinterlace = cadence.chain.clone();
+    if ivtc && !temporal.mode.is_confident() {
+        warnings.push(
+            "cadence classifier was not confident; IVTC applied conservatively".into(),
+        );
+    }
+    let effective_fps = cadence.fps;
+    let temporal_note = cadence.describe(temporal.mode);
+    let temporal_note = format!("{} — {}", temporal_note, temporal.summary());
 
     // --- geometry -----------------------------------------------------------
     let (target_width, target_height) =
@@ -503,12 +810,14 @@ pub fn build_plan(
     let upscale_factor = target_height as f32 / square_h.max(1) as f32;
 
     // --- interpolation ------------------------------------------------------
-    let interpolation =
+    let (interpolation, interpolation_engine) =
         resolve_interpolation(profile, engines, ff, effective_fps, &mut warnings);
     if interpolation.enabled && interpolation.method != InterpolationMethod::Off {
         notes.push(format!(
-            "interpolation: {} across {} cuts is disabled by design",
-            interpolation.note, scenes.cut_count()
+            "interpolation: {} ({} cut(s) in this file are shot boundaries the interpolation \
+             is never allowed to cross)",
+            interpolation.note,
+            scenes.cut_count()
         ));
     }
 
@@ -549,6 +858,63 @@ pub fn build_plan(
 
     let estimated_frames = (duration_seconds * interpolation.target_fps.to_f64()).round() as u64;
 
+    // --- who executes the video work ----------------------------------------
+    //
+    // A model engine can only be used through the native executor, so the choice
+    // of executor follows from whether a model was actually selected — not from
+    // what the profile asked for.
+    let restoration_engine = if profile.restoration.enabled {
+        engines.model_engine()
+    } else {
+        None
+    };
+    let model_engine = interpolation_engine.clone().or_else(|| restoration_engine.clone());
+    let executor = if model_engine.is_some() {
+        VideoExecutor::NativeInference
+    } else {
+        VideoExecutor::FfmpegSinglePass
+    };
+    let inference = model_engine.as_ref().map(|engine| {
+        let caps = engine.capabilities();
+        let mut tasks = Vec::new();
+        if restoration_engine.is_some() && caps.restore {
+            tasks.push("restore".to_string());
+        }
+        if interpolation.method == InterpolationMethod::Plugin {
+            tasks.push("interpolate".to_string());
+        }
+        InferencePlan {
+            engine_id: engine.id().to_string(),
+            tasks: tasks.clone(),
+            temporal_window: caps.temporal_window.clamp(2, 5),
+            max_batch: caps.max_batch.max(1),
+            width: square_w as u32,
+            height: square_h as u32,
+            model_upscale: if tasks.iter().any(|t| t == "restore") {
+                caps.upscale
+            } else {
+                1.0
+            },
+            precision: caps.precision.clone(),
+            model: caps.model.clone(),
+            can_reconfigure: caps.can_reconfigure,
+            restore_strength: 1.0,
+            note: format!(
+                "{} → {}",
+                if caps.model.is_empty() {
+                    engine.display_name()
+                } else {
+                    caps.model.clone()
+                },
+                if tasks.is_empty() {
+                    "no task selected".to_string()
+                } else {
+                    tasks.join(" + ")
+                }
+            ),
+        }
+    });
+
     let mut video = VideoPlan {
         source: VideoSourceInfo {
             width: raw_w as u32,
@@ -567,21 +933,69 @@ pub fn build_plan(
         },
         temporal_mode: temporal.mode,
         temporal_note,
+        cadence,
         ivtc,
-        deinterlace: deinterlace.or(temporal_filter),
+        deinterlace,
         target_width,
         target_height,
         upscale_factor,
         interpolation,
+        executor,
+        inference,
         regrain_strength: profile.output.regrain_strength,
         filter_chain: String::new(),
+        decode_chain: String::new(),
         encoder,
         encoder_chain,
         pix_fmt: String::new(),
         estimated_frames,
     };
     video.pix_fmt = video.encoder.pix_fmt.clone();
-    video.filter_chain = build_filter_chain(&video, (square_w as u32, square_h as u32));
+    // The model receives the target geometry the pixels must end up at, so the
+    // final resize happens after the model rather than before it.
+    video.target_width = target_width;
+    video.decode_chain = build_decode_chain(&video);
+    video.filter_chain = if video.uses_model() {
+        build_post_chain(&video, model_output_geometry(video.inference.as_ref()))
+    } else {
+        build_filter_chain(&video, (square_w as u32, square_h as u32))
+    };
+
+    match (&video.executor, &video.inference) {
+        (VideoExecutor::NativeInference, Some(inference)) => {
+            notes.push(format!(
+                "video executor: native inference — {} handles {} through a model session, \
+                 one shot at a time",
+                inference.engine_id,
+                if inference.tasks.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    inference.tasks.join(" + ")
+                }
+            ));
+            notes.push(format!(
+                "model sees {}x{} interleaved RGB at {} fps{}; final resize to {}x{} stays \
+                 deterministic (Lanczos) because the model does not invent pixels at that size",
+                inference.width,
+                inference.height,
+                effective_fps.to_f64(),
+                if (inference.model_upscale - 1.0).abs() > 0.001 {
+                    format!(", model upscales {:.2}x", inference.model_upscale)
+                } else {
+                    String::new()
+                },
+                target_width,
+                target_height
+            ));
+        }
+        _ => {
+            notes.push(
+                "video executor: one FFmpeg pass — no model session is opened, so nothing is \
+                 restored or synthesised"
+                    .into(),
+            );
+        }
+    }
 
     if video.source.is_hdr {
         warnings.push(
@@ -590,13 +1004,13 @@ pub fn build_plan(
                 .into(),
         );
     }
-    if upscale_factor > 2.5 {
+    if upscale_factor > 2.5 && video.executor == VideoExecutor::FfmpegSinglePass {
         warnings.push(format!(
             "upscaling by {upscale_factor:.2}x invents no detail: the deterministic path only \
              resamples. A restoration model is required for real detail."
         ));
     }
-    if profile.restoration.enabled && !engines.has_plugin() {
+    if profile.restoration.enabled && restoration_engine.is_none() {
         warnings.push(
             "the profile asks for model restoration but no inference plugin is installed: \
              running the deterministic path instead"
@@ -605,8 +1019,8 @@ pub fn build_plan(
     }
     if !profile.restoration.enabled {
         notes.push(
-            "restoration: disabled — no model backend, so no detail is invented (this is the \
-             honest default)"
+            "restoration: disabled by the profile — no detail is invented (the deterministic \
+             default)"
                 .into(),
         );
     }
@@ -799,6 +1213,11 @@ mod tests {
             },
             temporal_mode: TemporalMode::Progressive,
             temporal_note: String::new(),
+            cadence: CadencePlan::plan(
+                TemporalMode::Progressive,
+                Rational::new(24000, 1001).unwrap(),
+                true,
+            ),
             ivtc: false,
             deinterlace: None,
             target_width: 1440,
@@ -814,8 +1233,11 @@ mod tests {
                 scene_cuts_respected: true,
                 note: String::new(),
             },
+            executor: VideoExecutor::FfmpegSinglePass,
+            inference: None,
             regrain_strength: 0.0,
             filter_chain: String::new(),
+            decode_chain: String::new(),
             encoder: SelectedVideoEncoder {
                 name: "av1_nvenc".into(),
                 codec: VideoCodec::Av1,

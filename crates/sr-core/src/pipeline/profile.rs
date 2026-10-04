@@ -81,7 +81,12 @@ pub struct RestorationSettings {
 impl Default for RestorationSettings {
     fn default() -> Self {
         RestorationSettings {
-            enabled: false, // requires a model plugin; the baseline cannot restore
+            // The safe-16gb profile *asks* for the model, because that is what
+            // the product is for. When no plugin is installed the planner
+            // downgrades loudly — a warning in the plan, a note in the log and
+            // `ffmpeg-single-pass` in the executor row — rather than quietly
+            // pretending restoration happened.
+            enabled: true,
             model: "SeedVR2-3B".into(),
             weights: "fp8_e4m3fn".into(),
             vae_dtype: "bfloat16".into(),
@@ -116,7 +121,9 @@ impl Default for InterpolationSettings {
     fn default() -> Self {
         InterpolationSettings {
             multiplier: 2,
-            method: InterpolationMethod::Duplicate,
+            // "Film mode" asks for the model; `resolve_interpolation` downgrades
+            // to frame duplication, with a warning, when no plugin is installed.
+            method: InterpolationMethod::Plugin,
             scene_cut_protection: true,
             skip_static_frames: true,
         }
@@ -304,6 +311,7 @@ impl RestorationProfile {
         profile.name = "preview".into();
         profile.description = "Half-resolution preview encode for checking a pipeline run.".into();
         profile.output.quality = 30;
+        profile.restoration.enabled = false;
         profile.interpolation.multiplier = 1;
         profile.interpolation.method = InterpolationMethod::Off;
         profile

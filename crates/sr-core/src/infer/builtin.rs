@@ -1,7 +1,13 @@
 //! The engines that ship with the application: FFmpeg, and an optional plugin.
 
-use super::abi::{PluginCapabilities, PluginLibrary};
-use super::{Capabilities, EngineKind, EngineStatus, InferenceEngine};
+use super::abi::{
+    DeviceInfo, ExecOutcome, FrameBuffer, JobOptions, PluginCapabilities, PluginLibrary, Session,
+    SessionRequest,
+};
+use super::{
+    Capabilities, EngineKind, EngineSession, EngineStatus, InferenceEngine, WorkingSetRequest,
+};
+use crate::error::{Error, Result};
 use crate::ffmpeg::Ffmpeg;
 use std::sync::Arc;
 
@@ -55,6 +61,13 @@ impl InferenceEngine for FfmpegEngine {
             precision: vec!["8bit".into(), "10bit".into()],
             vendor: None,
             notes,
+            max_batch: 1,
+            temporal_window: 2,
+            max_multiplier: 16,
+            upscale: 1.0,
+            can_reconfigure: false,
+            model: String::new(),
+            devices: Vec::new(),
         }
     }
 
@@ -73,9 +86,11 @@ impl InferenceEngine for FfmpegEngine {
 
 /// FFmpeg's motion-compensated interpolator.
 ///
-/// Real motion interpolation, no model required — but slow, and it will happily
-/// morph across a cut if it is not told where the cuts are, which is why the plan
-/// only enables it explicitly.
+/// Real motion interpolation, no model required — but slow, and it decides on
+/// its own where the cuts are. That is precisely why it is *not* used to satisfy
+/// a request for model interpolation: it cannot be told which frame pairs are
+/// legal, so the promise "nothing is ever synthesised across a cut" would be
+/// FFmpeg's to keep or break.
 pub struct MinterpolateEngine {
     ff: Arc<Ffmpeg>,
 }
@@ -85,7 +100,7 @@ impl MinterpolateEngine {
         MinterpolateEngine { ff }
     }
 
-    /// Ready-to-use filter arguments for a 2x interpolation of `2x` output.
+    /// Ready-to-use filter arguments for a 2x interpolation.
     pub fn filter_args(&self) -> String {
         // `scd=quick` enables scene-change detection inside the filter, and
         // `mi_mode=mci` is the motion-compensated mode.
@@ -119,7 +134,15 @@ impl InferenceEngine for MinterpolateEngine {
             notes: vec![
                 "motion estimation in software: expect a large slowdown on 1080p+".into(),
                 "no generative detail, so no hallucination artefacts".into(),
+                "cut detection is FFmpeg's, not the engine's, so a cut can be crossed".into(),
             ],
+            max_batch: 1,
+            temporal_window: 2,
+            max_multiplier: 16,
+            upscale: 1.0,
+            can_reconfigure: false,
+            model: String::new(),
+            devices: Vec::new(),
         }
     }
 
@@ -137,26 +160,50 @@ impl InferenceEngine for MinterpolateEngine {
 }
 
 /// A loaded inference plugin: the only path that can restore or truly
-/// interpolate with a model, and it is entirely optional.
+/// interpolate with a model.
 pub struct PluginEngine {
-    library: PluginLibrary,
+    library: Arc<PluginLibrary>,
     capabilities: PluginCapabilities,
+    devices: Vec<DeviceInfo>,
 }
 
 impl PluginEngine {
-    pub fn new(library: PluginLibrary, capabilities: PluginCapabilities) -> Self {
+    pub fn new(
+        library: Arc<PluginLibrary>,
+        capabilities: PluginCapabilities,
+        devices: Vec<DeviceInfo>,
+    ) -> Self {
         PluginEngine {
             library,
             capabilities,
+            devices,
         }
     }
 
-    pub fn library(&self) -> &PluginLibrary {
+    pub fn library(&self) -> &Arc<PluginLibrary> {
         &self.library
     }
 
     pub fn capabilities_raw(&self) -> &PluginCapabilities {
         &self.capabilities
+    }
+
+    pub fn devices(&self) -> &[DeviceInfo] {
+        &self.devices
+    }
+
+    /// Opens a session on the best device the plugin offers.
+    ///
+    /// This is the call that turns "the plugin is loaded" into "the model is
+    /// resident and frames can be pushed through it".
+    pub fn open_session_with(&self, request: &SessionRequest) -> Result<Box<dyn EngineSession>> {
+        let session = Session::open(&self.library, request)?;
+        Ok(Box::new(PluginSession {
+            session,
+            capabilities: self.capabilities.clone(),
+            working: WorkingSetRequest::default(),
+            calls: 0,
+        }))
     }
 }
 
@@ -174,30 +221,19 @@ impl InferenceEngine for PluginEngine {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            scale: self.capabilities.scale,
-            interpolate: self.capabilities.interpolate,
-            restore: self.capabilities.restore,
-            max_pixels: self.capabilities.max_pixels,
-            backends: if self.capabilities.backend.is_empty() {
-                vec![]
-            } else {
-                vec![self.capabilities.backend.clone()]
-            },
-            precision: if self.capabilities.precision.is_empty() {
-                vec![]
-            } else {
-                vec![self.capabilities.precision.clone()]
-            },
-            vendor: self.capabilities.vendor.clone(),
-            notes: vec![format!(
-                "reports ABI {} capabilities at load time",
-                self.capabilities.abi_version
-            )],
-        }
+        let mut caps = Capabilities::from(&self.capabilities);
+        caps.devices = self.devices.iter().map(DeviceInfo::describe).collect();
+        caps
     }
 
     fn status(&self) -> EngineStatus {
+        let caps = self.capabilities();
+        if !caps.scale && !caps.interpolate && !caps.restore {
+            return EngineStatus::Unavailable("plugin declares no operation it can run".into());
+        }
+        if self.devices.is_empty() {
+            return EngineStatus::Unavailable("plugin reports no usable device".into());
+        }
         EngineStatus::Ready
     }
 
@@ -211,6 +247,95 @@ impl InferenceEngine for PluginEngine {
                 .map(|v| format!(" on {v}"))
                 .unwrap_or_default()
         )
+    }
+
+    fn open_session(&self, request: &SessionRequest) -> Result<Box<dyn EngineSession>> {
+        self.open_session_with(request)
+    }
+}
+
+/// A live plugin session, adapted to the engine's session trait.
+pub struct PluginSession {
+    session: Session,
+    capabilities: PluginCapabilities,
+    working: WorkingSetRequest,
+    calls: u64,
+}
+
+impl PluginSession {
+    /// Working-set change that the *job* can carry: tiling and batch size.
+    fn tile(&self) -> Option<(u32, u32)> {
+        if self.working.tile >= self.capabilities.tile_min && self.working.tile > 0 {
+            Some((self.working.tile, self.working.tile))
+        } else {
+            None
+        }
+    }
+}
+
+impl EngineSession for PluginSession {
+    fn engine_id(&self) -> &str {
+        "inference-plugin"
+    }
+
+    fn interpolate(
+        &mut self,
+        inputs: &mut [FrameBuffer],
+        outputs: &mut [FrameBuffer],
+        options: &JobOptions,
+    ) -> Result<ExecOutcome> {
+        if options.multiplier < 2 {
+            return Err(Error::Unsupported(
+                "interpolation with a multiplier below 2 is a copy, not a model call".into(),
+            ));
+        }
+        let window = inputs.len() as u32;
+        if window > self.capabilities.max_temporal_window {
+            return Err(Error::Unsupported(format!(
+                "the model accepts at most {} input frames per call, {} given",
+                self.capabilities.max_temporal_window,
+                window
+            )));
+        }
+        let mut options = options.clone();
+        options.tile = self.tile();
+        self.calls += 1;
+        self.session.interpolate(inputs, outputs, &options)
+    }
+
+    fn restore(
+        &mut self,
+        frames: &mut [FrameBuffer],
+        options: &JobOptions,
+    ) -> Result<ExecOutcome> {
+        let mut options = options.clone();
+        options.tile = self.tile();
+        if frames.len() as u32 > self.capabilities.max_batch {
+            return Err(Error::Unsupported(format!(
+                "the model accepts at most {} frames per restore call, {} given",
+                self.capabilities.max_batch,
+                frames.len()
+            )));
+        }
+        self.calls += 1;
+        self.session.restore(frames, &options)
+    }
+
+    fn reconfigure(&mut self, request: &WorkingSetRequest) -> Result<()> {
+        // Tiling and batch size travel with each job, so they can change under a
+        // live session. Precision, offload and block swapping are properties of
+        // the loaded weights: those need the session reopened, and the executor
+        // does that rather than pretending the change took effect.
+        let needs_reopen = request.precision != self.working.precision
+            || request.offload != self.working.offload
+            || request.block_swap != self.working.block_swap;
+        self.working = request.clone();
+        if needs_reopen {
+            return Err(Error::Unsupported(
+                "precision/offload/block-swap changes require reopening the model session".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +373,9 @@ mod tests {
         let selected = registry.select(super::super::InferenceTask::Scale);
         assert!(selected.is_some(), "scaling must always be available");
         assert_eq!(selected.unwrap().id(), "ffmpeg-baseline");
-        assert!(registry.select(super::super::InferenceTask::Restore).is_none());
+        assert!(registry
+            .select(super::super::InferenceTask::Restore)
+            .is_none());
+        assert!(registry.model_engine().is_none());
     }
 }

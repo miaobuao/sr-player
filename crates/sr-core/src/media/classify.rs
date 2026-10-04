@@ -164,15 +164,36 @@ impl TemporalReport {
         self.totals.repeated_field_ratio()
     }
 
+    /// Frames the per-frame detector saw combing in, over every frame it looked
+    /// at. This is the signal that can veto the aggregate.
+    pub fn single_frame_combing_ratio(&self) -> f64 {
+        let seen = self.totals.single_tff
+            + self.totals.single_bff
+            + self.totals.single_progressive
+            + self.totals.single_undetermined;
+        if seen == 0 {
+            0.0
+        } else {
+            (self.totals.single_tff + self.totals.single_bff) as f64 / seen as f64
+        }
+    }
+
     /// What the plan builder and the UI both want in one line.
+    ///
+    /// The label comes first and the raw detector ratios after it in brackets,
+    /// because the two can legitimately disagree — the per-frame veto in
+    /// [`decide`] exists precisely for that case — and a line reading
+    /// "progressive (interlaced 100%)" without that framing looks like a bug.
     pub fn summary(&self) -> String {
         format!(
-            "{} ({:.0}% confident; progressive {:.0}%, interlaced {:.0}%, repeated fields {:.0}%)",
+            "{} ({:.0}% confident; idet aggregate: progressive {:.0}%, interlaced {:.0}%, \
+             repeated fields {:.0}%; per-frame combing {:.0}%)",
             self.mode.as_str(),
             self.confidence * 100.0,
             self.progressive_ratio() * 100.0,
             self.interlaced_ratio() * 100.0,
-            self.repeated_field_ratio() * 100.0
+            self.repeated_field_ratio() * 100.0,
+            self.single_frame_combing_ratio() * 100.0
         )
     }
 }
@@ -291,6 +312,18 @@ fn apply_counts(target: &mut IdetCounts, kind: &str, counts: &BTreeMap<String, u
     }
 }
 
+/// How much of the single-frame detector's verdict has to agree before the frame
+/// analysis overrules an explicit "progressive" in the container.
+///
+/// `idet`'s multi-frame detector is stateful: once a frame is called TFF the next
+/// one is judged against it, so a single pathological pattern can colour the whole
+/// file. `ffmpeg -f lavfi -i testsrc2 ... -c:v libx264` does exactly that — 24
+/// progressive frames, reported as `Multi frame detection: TFF: 24` — while every
+/// other synthetic source comes back undetermined. The per-frame detector is not
+/// fooled the same way, so it gets a vote before a progressive file is
+/// deinterlaced.
+const SINGLE_FRAME_VETO: f64 = 0.50;
+
 /// Classifies from aggregated statistics. Pure, so it is unit-tested directly.
 pub fn decide(
     totals: &IdetCounts,
@@ -305,12 +338,41 @@ pub fn decide(
     }
 
     let progressive = totals.progressive_ratio();
-    let interlaced = totals.interlaced_ratio();
+    let mut interlaced = totals.interlaced_ratio();
     let repeated = totals.repeated_field_ratio();
+
+    // A container that says "progressive" is evidence, and so is a per-frame
+    // detector that mostly cannot see combing. Neither outranks the frames
+    // themselves, but together they outrank one stateful aggregate.
+    //
+    // The denominator is every frame the per-frame detector looked at, not only
+    // the ones it managed to classify: "undetermined" is the detector saying it
+    // saw nothing, and it must not be counted as agreement with the aggregate.
+    let single_seen =
+        totals.single_tff + totals.single_bff + totals.single_progressive + totals.single_undetermined;
+    let single_interlaced = if single_seen == 0 {
+        1.0
+    } else {
+        (totals.single_tff + totals.single_bff) as f64 / single_seen as f64
+    };
+    let mut vetoed = false;
+    if !declared_interlaced && interlaced >= 0.60 && single_interlaced < SINGLE_FRAME_VETO {
+        notes.push(format!(
+            "container field_order={} and the per-frame detector ({}% of {} frames showed \
+             combing) disagree with the aggregate ({}% interlaced): treating this as progressive \
+             rather than deinterlacing on one signal",
+            field_order.unwrap_or("unknown"),
+            (single_interlaced * 100.0).round(),
+            single_seen,
+            (interlaced * 100.0).round()
+        ));
+        interlaced = 0.0;
+        vetoed = true;
+    }
 
     // Telecine: duplicated fields are the fingerprint. 3:2 pulldown duplicates
     // one field in every 5-frame group, so even a clean transfer shows ~20%.
-    let telecine = repeated >= 0.10 && interlaced >= 0.05;
+    let telecine = !vetoed && repeated >= 0.10 && interlaced >= 0.05;
     let mode = if telecine {
         TemporalMode::Telecine
     } else if progressive >= 0.90 {
@@ -318,6 +380,8 @@ pub fn decide(
     } else if interlaced >= 0.60 {
         TemporalMode::Interlaced
     } else if progressive >= 0.60 && interlaced < 0.20 {
+        TemporalMode::Progressive
+    } else if vetoed {
         TemporalMode::Progressive
     } else {
         TemporalMode::Mixed
@@ -339,7 +403,7 @@ pub fn decide(
                 .to_string(),
         );
     }
-    if !declared_interlaced && matches!(mode, TemporalMode::Interlaced | TemporalMode::Telecine) {
+    if !declared_interlaced && !vetoed && matches!(mode, TemporalMode::Interlaced | TemporalMode::Telecine) {
         notes.push(format!(
             "container field_order={} disagrees with frame analysis ({}): trusting the frames",
             field_order.unwrap_or("unknown"),
@@ -563,6 +627,54 @@ mod tests {
             repeated_repeat: repeated.3,
             ..Default::default()
         }
+    }
+
+    /// The real numbers `ffmpeg -f lavfi -i testsrc2 -c:v libx264` produces:
+    /// the aggregate says interlaced for every frame, the per-frame detector
+    /// cannot see combing in most of them, and the container says progressive.
+    fn with_single(
+        mut base: IdetCounts,
+        single: (u64, u64, u64, u64),
+    ) -> IdetCounts {
+        base.single_tff = single.0;
+        base.single_bff = single.1;
+        base.single_progressive = single.2;
+        base.single_undetermined = single.3;
+        base
+    }
+
+    #[test]
+    fn a_progressive_container_and_weak_per_frame_evidence_beat_the_aggregate() {
+        let c = with_single(
+            counts((72, 0, 0, 0), (72, 0, 0, 0), 72),
+            (23, 0, 4, 45),
+        );
+        let (mode, _, notes) = decide(&c, false, Some("progressive"));
+        assert_eq!(
+            mode,
+            TemporalMode::Progressive,
+            "a stateful aggregate must not deinterlace a file whose container says \
+             progressive and whose frames mostly show no combing: {notes:?}"
+        );
+        assert!(!mode.needs_deinterlace());
+        assert!(
+            notes.iter().any(|n| n.contains("per-frame detector")),
+            "the decision must be explained: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn real_interlacing_still_wins_over_a_progressive_container_flag() {
+        // Interlaced video: the per-frame detector sees combing in most frames, so
+        // there is no veto and the frames win, as they should.
+        let c = with_single(
+            counts((280, 0, 0, 20), (300, 0, 0, 0), 300),
+            (200, 0, 10, 90),
+        );
+        let (mode, _, notes) = decide(&c, false, Some("progressive"));
+        assert_eq!(mode, TemporalMode::Interlaced, "{notes:?}");
+        assert!(mode.needs_deinterlace());
+        assert!(notes.iter().any(|n| n.contains("trusting the frames")));
     }
 
     #[test]

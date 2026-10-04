@@ -37,6 +37,16 @@ because it lies regularly. The four outcomes drive four different filter chains,
 and getting it wrong is irreversible: `decimate` on real interlaced video
 destroys half the temporal information.
 
+One refinement matters in practice: `idet`'s *multi-frame* detector is stateful,
+so a single pathological pattern can colour a whole file. `testsrc2` encoded with
+libx264 — a perfectly progressive clip — reports `Multi frame detection: TFF` for
+every frame, while every other synthetic source comes back undetermined. So when
+the container says progressive *and* the per-frame detector saw combing in less
+than half the frames, the aggregate is overruled and the file is left alone. A
+container that lies on genuinely interlaced content still loses: real combing is
+visible per frame, so the per-frame signal agrees with the aggregate and there is
+no veto.
+
 ### Shots before interpolation
 
 `media::scene` finds cuts natively (32-bin histogram + edge topology + luma MAD,
@@ -44,6 +54,12 @@ threshold adapted from the median/MAD of recent scores). A candidate cut is held
 for one frame and confirmed only if the change persists, so a camera flash or a
 lightning strike does not disable interpolation around it. Nothing is ever
 synthesised across a cut.
+
+Crucially, the shot list is measured on the **decoded** stream — the same cadence
+chain (`CadencePlan`) the encoder and the model use — so `Shot::start_frame`
+means "the Nth frame the model will see". On a 3:2 telecine source the raw and
+decoded numbering differ by 20%, and a shot list that is off by 20% protects
+nothing.
 
 ### Measure, then decide, then maybe do nothing
 
@@ -69,6 +85,16 @@ detector produces a gentle touch, not a confident mistake.
   ordered by cost: throughput first (block swap), then quality (VAE tile), then
   temporal consistency (batch). Batches are restricted to valid `4n+1` values
   (`5 → 1`), because `3` is not a batch this class of model can accept.
+* A model backend that answers `SR_ERR_OUT_OF_MEMORY` is not a failure: the
+  executor tells the session about the smaller working set (or reports that the
+  backend cannot apply it in place) and runs the *same segment* again. The
+  reference plugin can inject that fault on demand, so the ladder is tested
+  end to end rather than by inspection.
+* A backend that fails outright **fails the job**. It is not silently replaced by
+  a deterministic encode: the plan promised a frame rate and a level of detail
+  that the fallback cannot produce, so the fallback's own QC stage would reject
+  the result — with a message ("planned 48 fps, got 24") that hides the real
+  reason. The recovery path is a re-run, which resumes from the committed chunks.
 * The worker-per-stage rule is documented in `infer`: one model resident at a
   time, stages sequenced, because two models do not fit on a 16 GB card.
 
@@ -90,18 +116,58 @@ now computed from `ebur128`, one source of truth.
 
 ## The inference ABI
 
-`include/sr_infer.h` defines three exported symbols
-(`sr_infer_abi_version`, `sr_infer_capabilities`, `sr_infer_run`). A plugin can
-be backed by Vulkan compute, DirectML, OpenVINO, MIGraphX, TensorRT or a CPU
-kernel; the engine only asks what it can do and hands it frames.
+`include/sr_infer.h` defines ABI **v2**: device enumeration (`sr_infer_devices`),
+session lifecycle (`sr_infer_open` / `sr_infer_close`), capability query
+(`sr_infer_query`), execution (`sr_infer_execute`), async fences
+(`sr_infer_poll`) and structured errors (`sr_infer_last_error`). A job carries an
+N-frame temporal window, an op (`restore` / `interpolate` / `scale`), a dtype and
+layout, a tile size, a rational timestamp per frame, a chunk id and a seed. Every
+struct starts with its own `struct_size`, so the ABI can grow without breaking
+2.0 binaries.
 
+Version 1 -- one call, two 8-bit frames in, one frame out -- is rejected at load
+time with a message that says to recompile against the header. It was a
+prototype: it could not express a temporal window, a device or a memory budget,
+so a plugin could be *loaded* with no way to *run a model*.
+
+A plugin can be backed by Vulkan compute, DirectML, OpenVINO, MIGraphX, TensorRT,
+ncnn or a CPU kernel; the engine only asks what it can do and hands it frames.
 `crates/sr-infer-plugin-example` is a real shared library implementing that ABI
-with **no dependency on `sr-core`**, and `sr-core`'s tests load it through
-`dlopen`/`LoadLibrary` and call it. The boundary is verified, not aspirational.
+with **no dependency on `sr-core`** (it keeps its own copies of the structs, so a
+drift between the header and the engine's bindings fails a test instead of
+misreading memory), and `sr-core`'s tests load it through
+`dlopen`/`LoadLibrary` and call it.
 
 Engines are ranked and selected: plugin (model) > `minterpolate`
 (motion-compensated, FFmpeg) > deterministic resample. The baseline always
 exists, so the pipeline always has a correct answer.
+
+### What executes the model
+
+Selection is not execution. `pipeline::segments` turns the shot list into an
+exact sequence of model calls and output slots; `pipeline::native` drives it:
+
+```text
+shots ──► segments ──► chunks ──► decode ─► session ─► chunk file ─► concat ─► mux
+           (never      (resume                  (sr_infer_execute)
+            across      unit)
+            a cut)
+```
+
+A segment covers input frames `[first..=last]` and emits output slots
+`m*first..=m*last`; consecutive segments overlap by one frame and drop the slot
+the previous one already wrote, so the counts telescope to exactly `m*(n-1)+1`
+regardless of how the work was split. A segment containing a shot boundary or a
+dissolve guard is `Hold`: frames are repeated and **the model is not called at
+all**. That is what makes "nothing is synthesised across a cut" a property of the
+data flow rather than a promise to a filter.
+
+`minterpolate` is never used to satisfy a request for model interpolation: if the
+plan says `InterpolationMethod::Plugin` then the executor is
+`VideoExecutor::NativeInference`, and the two are cross-checked by tests. If no
+plugin is installed the plan downgrades *loudly* to frame duplication, with a
+warning in the plan and `ffmpeg-single-pass` in the executor row -- it does not
+quietly run a different algorithm.
 
 ## Stage map
 
@@ -109,13 +175,20 @@ exists, so the pipeline always has a correct answer.
 |---|---|---|
 | Probe | ffprobe → typed manifest (streams, colour, SAR/DAR, chapters, attachments) | yes |
 | Temporal | `idet` sampling → progressive/telecine/interlaced/mixed | yes |
-| Scenes | native shot detection → shots with rational timestamps | yes |
+| Scenes | native shot detection → shots with rational timestamps, measured on the **decoded** cadence | yes |
 | AudioAnalysis | `ebur128` + native BS.1770 + dialogue detection → LDR decision | yes |
-| Plan | resolution, filters, encoder chain, VRAM budget, reasons and warnings | yes |
-| Restore / Interpolate / Regrain | folded into the encode pass in the deterministic path, with honest notes | n/a |
+| Plan | executor, geometry, encoder chain, VRAM budget, working set, reasons and warnings | yes |
+| Restore / Interpolate | a model session per job; per-segment calls; OOM walks the degrade ladder | per chunk |
+| Regrain | FFmpeg noise after the model (no per-shot grain estimator in this build) | n/a |
 | AudioProcess | dialogue rider + band duck → float WAV on disk (never in RAM) | chunk row |
-| Encode / Mux | one FFmpeg pass: filter chain, encoder chain, loudness gain, limiter, `-map` everything | progress events |
-| Qc | 11 checks comparing the output with the plan | yes |
+| Encode | native path: one encode per chunk + concat; deterministic path: one FFmpeg pass | per chunk |
+| Mux | concatenated video + enhanced track + originals + subtitles + attachments + chapters | progress events |
+| Qc | 9-11 checks comparing the output with the plan | yes |
+
+| executor | Restore / Interpolate / Regrain |
+|---|---|
+| `ffmpeg-single-pass` | folded into the encode pass, with honest notes about what is *not* happening |
+| `native-inference` | decode → `sr_infer_execute` per segment → per-chunk encode → concat → mux |
 
 ## Memory
 

@@ -41,6 +41,16 @@ pub enum Error {
     #[error("plugin {plugin} error: {detail}")]
     Plugin { plugin: String, detail: String },
 
+    /// A model backend ran out of device memory.
+    ///
+    /// Kept as its own variant rather than a string, because this is the one
+    /// failure the pipeline *answers* instead of reporting: an OOM must walk
+    /// the degrade ladder (smaller tiles, more offload, smaller batch) and run
+    /// the same chunk again. Classifying it by substring would make that
+    /// behaviour depend on wording.
+    #[error("inference backend {engine} is out of device memory: {detail}")]
+    DeviceMemory { engine: String, detail: String },
+
     #[error("io error on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -70,6 +80,7 @@ impl Error {
             // to the next one, and both are cheap next to losing a job.
             Error::Ffmpeg { .. } => true,
             Error::Plugin { .. } => true, // fall back to the FFmpeg executor
+            Error::DeviceMemory { .. } => true, // walk the degrade ladder
             Error::Stage { .. } => true,
             Error::Cancelled => false,
             Error::Unsupported(_) => false,
@@ -88,6 +99,7 @@ impl Error {
     pub fn is_oom(&self) -> bool {
         match self {
             Error::Ffmpeg { oom, .. } => *oom,
+            Error::DeviceMemory { .. } => true,
             other => looks_like_oom(&other.to_string()),
         }
     }

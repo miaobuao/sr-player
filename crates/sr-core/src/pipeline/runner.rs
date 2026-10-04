@@ -26,8 +26,9 @@ use crate::infer::EngineRegistry;
 use crate::media::classify::classify;
 use crate::media::manifest::MediaManifest;
 use crate::media::probe::probe;
-use crate::media::scene::detect_scenes;
-use crate::pipeline::plan::{build_plan, AudioPlan, ConversionPlan, PlanRequest, VideoPlan};
+use crate::media::scene::{detect_scenes, SceneDecode, SceneReport};
+use crate::pipeline::native::ChunkEncoding;
+use crate::pipeline::plan::{build_plan, cadence_for, AudioPlan, ConversionPlan, PlanRequest, VideoPlan};
 use crate::pipeline::profile::LoudnessTarget;
 use crate::state::{commit_file_atomic, ChunkRow, NewJob, ResumePoint, Store};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -43,6 +44,8 @@ pub struct RunnerOptions {
     /// Stop after the plan is produced, without touching any pixels.
     pub dry_run: bool,
     pub max_degrade_retries: u32,
+    /// How the native executor stores its per-chunk checkpoints.
+    pub chunk_encoding: ChunkEncoding,
 }
 
 impl Default for RunnerOptions {
@@ -52,6 +55,9 @@ impl Default for RunnerOptions {
             keep_intermediates: false,
             dry_run: false,
             max_degrade_retries: 4,
+            // FFV1 intermediates: one encode at the end, so the published file
+            // cannot depend on where the chunk boundaries happened to fall.
+            chunk_encoding: ChunkEncoding::LosslessIntermediate,
         }
     }
 }
@@ -359,6 +365,10 @@ impl PipelineRunner {
             )
         })?;
 
+        // Shot boundaries are measured on the *decoded* stream — the same cadence
+        // chain the encoder and the model will see — so `Shot::start_frame` means
+        // "the Nth frame the model gets", not "the Nth frame in the file".
+        let cadence = cadence_for(&manifest, &temporal)?;
         let scenes = self.run_stage(reporter, resume, job_id, Stage::Scenes, |r| {
             detect_scenes(
                 &self.ff,
@@ -366,6 +376,15 @@ impl PipelineRunner {
                 r,
                 &self.cancel,
                 &profile.analysis.scene,
+                SceneDecode {
+                    pre_chain: cadence.chain_str(),
+                    fps: cadence.fps,
+                    reason: if cadence.renumbers_frames {
+                        "decoded cadence after inverse telecine"
+                    } else {
+                        "decoded cadence"
+                    },
+                },
             )
         })?;
 
@@ -426,8 +445,13 @@ impl PipelineRunner {
         }
         self.check_cancel()?;
 
-        // ---- stages folded into the single-pass encode --------------------
-        self.announce_folded_stages(reporter, &plan);
+        // ---- stages inside the video work ----------------------------------
+        //
+        // This is where the executor is chosen for real. A plan that asks for
+        // model restoration or model interpolation is executed by pushing frames
+        // through a session; anything else is one FFmpeg pass. The log says which,
+        // because those two are not the same product.
+        self.announce_video_stages(reporter, &plan);
 
         // ---- audio remaster ------------------------------------------------
         let scratch = self.scratch_root.join(format!("job-{job_id}"));
@@ -497,7 +521,51 @@ impl PipelineRunner {
         };
 
         // ---- encode + mux + qc --------------------------------------------
-        let output = self.encode(request, &plan, remastered.as_deref(), reporter, options, &scratch)?;
+        let output = if plan.video.uses_model() {
+            // A failure here is *not* silently replaced by a deterministic encode.
+            // That fallback used to exist and it produced a file the plan's own QC
+            // then rejected — "planned 48 fps, got 24" — which hides the real
+            // reason. The model path resumes from its committed chunks, so the
+            // cheap recovery is to run the job again, not to publish something
+            // nobody asked for.
+            match self.native_video(
+                request,
+                &plan,
+                &scenes,
+                remastered.as_deref(),
+                reporter,
+                options,
+                &scratch,
+            ) {
+                Ok(output) => output,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(err) => {
+                    reporter.error(
+                        Some(Stage::Encode),
+                        format!(
+                            "the native inference path failed: {err}\n  the chunks that finished \
+                             are committed, so running this job again resumes from the last one; \
+                             `--profile deterministic` runs the model-free path instead"
+                        ),
+                    );
+                    reporter.stage(
+                        Stage::Restore,
+                        StageStatus::Failed,
+                        Some(err.to_string()),
+                    );
+                    return Err(err);
+                }
+            }
+        } else {
+            self.encode(
+                request,
+                &plan,
+                remastered.as_deref(),
+                reporter,
+                options,
+                &scratch,
+            )?
+        };
 
         let qc = self.run_stage(reporter, resume, job_id, Stage::Qc, |r| {
             self.quality_check(&manifest, &plan, &output, r)
@@ -535,58 +603,120 @@ impl PipelineRunner {
         Ok(output)
     }
 
-    /// The baseline engine folds restoration, interpolation and muxing into one
-    /// FFmpeg pass; the ladder still shows them, with honest statuses.
-    fn announce_folded_stages(&self, reporter: &Reporter, plan: &ConversionPlan) {
-        if plan.video.upscale_factor > 1.01 {
+    /// States, before any pixel moves, which stages the chosen executor really
+    /// runs.
+    ///
+    /// The baseline engine folds restoration, interpolation and muxing into a
+    /// single FFmpeg pass. The native executor does something categorically
+    /// different: it decodes frames, pushes them through a model, and checkpoints
+    /// each chunk. The ladder must reflect which one is about to happen, because
+    /// "interpolation: done" means two very different things in those two cases.
+    fn announce_video_stages(&self, reporter: &Reporter, plan: &ConversionPlan) {
+        if !plan.video.uses_model() {
+            if plan.video.upscale_factor > 1.01 {
+                reporter.stage(
+                    Stage::Restore,
+                    StageStatus::Skipped,
+                    Some(format!(
+                        "no model backend: the {:.2}x upscale is a deterministic Lanczos resample \
+                         folded into the encode, and invents no detail",
+                        plan.video.upscale_factor
+                    )),
+                );
+            } else {
+                reporter.stage(
+                    Stage::Restore,
+                    StageStatus::Skipped,
+                    Some("source resolution kept; no restoration engine requested".into()),
+                );
+            }
+            if plan.video.interpolation.enabled {
+                reporter.stage(
+                    Stage::Interpolate,
+                    StageStatus::Done,
+                    Some(format!(
+                        "{} folded into the encode; cut detection is FFmpeg's, not the engine's",
+                        plan.video.interpolation.method.as_str()
+                    )),
+                );
+            } else {
+                reporter.stage(
+                    Stage::Interpolate,
+                    StageStatus::Skipped,
+                    Some("interpolation disabled".into()),
+                );
+            }
+            reporter.stage(
+                Stage::Regrain,
+                StageStatus::Skipped,
+                Some(if plan.video.regrain_strength > 0.0 {
+                    format!(
+                        "re-grain strength {:.0} folded into the encode (FFmpeg noise, not a \
+                         per-shot grain model)",
+                        plan.video.regrain_strength
+                    )
+                } else {
+                    "re-grain disabled (no per-shot grain estimator in this build)".to_string()
+                }),
+            );
+            return;
+        }
+
+        let inference = plan.video.inference.as_ref().expect("native plan");
+        if inference.describes("restore") {
             reporter.stage(
                 Stage::Restore,
-                StageStatus::Done,
+                StageStatus::Running,
                 Some(format!(
-                    "deterministic {:.2}x resample folded into the encode; no model backend, so \
-                     no detail is invented",
-                    plan.video.upscale_factor
+                    "{} restores every frame through a model session at {}x{}, strength {:.2}",
+                    inference.engine_id,
+                    inference.width,
+                    inference.height,
+                    inference.restore_strength
                 )),
             );
         } else {
             reporter.stage(
                 Stage::Restore,
                 StageStatus::Skipped,
-                Some("source resolution kept; no restoration engine requested".into()),
+                Some("the model handles interpolation only; no restoration was requested".into()),
             );
         }
-        if plan.video.interpolation.enabled {
+        if inference.describes("interpolate") {
             reporter.stage(
                 Stage::Interpolate,
-                StageStatus::Done,
+                StageStatus::Running,
                 Some(format!(
-                    "{} folded into the encode; cuts are never crossed",
+                    "{} synthesises {:.3} fps from {:.3} fps, one shot at a time: a frame pair \
+                     that straddles a cut is never handed to the model",
+                    inference.engine_id,
+                    plan.video.interpolation.target_fps.to_f64(),
+                    plan.video.interpolation.source_fps.to_f64()
+                )),
+            );
+        } else {
+            reporter.stage(
+                Stage::Interpolate,
+                StageStatus::Skipped,
+                Some(format!(
+                    "{} (no model interpolation selected)",
                     plan.video.interpolation.method.as_str()
                 )),
             );
-        } else {
-            reporter.stage(
-                Stage::Interpolate,
-                StageStatus::Skipped,
-                Some("interpolation disabled".into()),
-            );
         }
-        if plan.video.regrain_strength > 0.0 {
-            reporter.stage(
-                Stage::Regrain,
-                StageStatus::Done,
-                Some(format!(
-                    "re-grain strength {:.0} folded into the encode",
+        reporter.stage(
+            Stage::Regrain,
+            StageStatus::Skipped,
+            Some(if plan.video.regrain_strength > 0.0 {
+                format!(
+                    "re-grain strength {:.0} applied by FFmpeg after the model (not a per-shot \
+                     grain model)",
                     plan.video.regrain_strength
-                )),
-            );
-        } else {
-            reporter.stage(
-                Stage::Regrain,
-                StageStatus::Skipped,
-                Some("re-grain disabled (no per-shot grain estimator in this build)".into()),
-            );
-        }
+                )
+            } else {
+                "re-grain disabled (no per-shot grain estimator in this build)".to_string()
+            }),
+        );
     }
 
     fn encode(
@@ -599,50 +729,7 @@ impl PipelineRunner {
         scratch: &Path,
     ) -> Result<PathBuf> {
         // Measure the enhanced track to calibrate the final gain.
-        let loudness_chain = if let Some(wav) = remastered {
-            match measure_wav_loudness(&self.ff, wav, reporter, &self.cancel) {
-                Ok(report) => match report.integrated_lufs {
-                    Some(measured) => {
-                        let (chain, gain_db, limiting) = build_gain_chain(
-                            measured,
-                            report.true_peak_dbtp,
-                            &plan.audio.loudness,
-                        );
-                        reporter.info(
-                            Some(Stage::AudioProcess),
-                            format!(
-                                "final loudness: {} → gain {:+.2} dB{}",
-                                report.summary(),
-                                gain_db,
-                                if limiting {
-                                    " (true-peak limiter engaged: dynamics touched)"
-                                } else {
-                                    " (pure gain: dynamics preserved)"
-                                }
-                            ),
-                        );
-                        Some(chain)
-                    }
-                    None => {
-                        reporter.warn(
-                            Some(Stage::AudioProcess),
-                            "the enhanced track has no measurable loudness; encoding without normalisation",
-                        );
-                        None
-                    }
-                },
-                Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(err) => {
-                    reporter.warn(
-                        Some(Stage::AudioProcess),
-                        format!("loudness measurement failed ({err}); encoding without normalisation"),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let loudness_chain = self.prepare_loudness_chain(remastered, plan, reporter)?;
 
         let temp_output = scratch.join(format!(
             "output.{}",
@@ -777,6 +864,133 @@ impl PipelineRunner {
 
         commit_file_atomic(&temp_output, &request.output)?;
         Ok(request.output.clone())
+    }
+
+    /// Measures the enhanced track and turns the measurement into the final gain
+    /// chain. Shared by both video executors, so the audio result cannot depend on
+    /// which one ran.
+    fn prepare_loudness_chain(
+        &self,
+        remastered: Option<&Path>,
+        plan: &ConversionPlan,
+        reporter: &Reporter,
+    ) -> Result<Option<String>> {
+        let Some(wav) = remastered else {
+            return Ok(None);
+        };
+        match measure_wav_loudness(&self.ff, wav, reporter, &self.cancel) {
+            Ok(report) => match report.integrated_lufs {
+                Some(measured) => {
+                    let (chain, gain_db, limiting) =
+                        build_gain_chain(measured, report.true_peak_dbtp, &plan.audio.loudness);
+                    reporter.info(
+                        Some(Stage::AudioProcess),
+                        format!(
+                            "final loudness: {} → gain {:+.2} dB{}",
+                            report.summary(),
+                            gain_db,
+                            if limiting {
+                                " (true-peak limiter engaged: dynamics touched)"
+                            } else {
+                                " (pure gain: dynamics preserved)"
+                            }
+                        ),
+                    );
+                    Ok(Some(chain))
+                }
+                None => {
+                    reporter.warn(
+                        Some(Stage::AudioProcess),
+                        "the enhanced track has no measurable loudness; encoding without normalisation",
+                    );
+                    Ok(None)
+                }
+            },
+            Err(Error::Cancelled) => Err(Error::Cancelled),
+            Err(err) => {
+                reporter.warn(
+                    Some(Stage::AudioProcess),
+                    format!("loudness measurement failed ({err}); encoding without normalisation"),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The native path: frames go through a model session, chunk by chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn native_video(
+        &self,
+        request: &PlanRequest,
+        plan: &ConversionPlan,
+        scenes: &SceneReport,
+        remastered: Option<&Path>,
+        reporter: &Reporter,
+        options: &RunnerOptions,
+        scratch: &Path,
+    ) -> Result<PathBuf> {
+        let loudness_chain = self.prepare_loudness_chain(remastered, plan, reporter)?;
+        let executor = crate::pipeline::native::NativeExecutor::new(
+            &self.ff,
+            &self.engines,
+            &self.store,
+            &self.cancel,
+        );
+        reporter.stage(Stage::Encode, StageStatus::Running, None);
+        let context = crate::pipeline::native::NativeContext {
+            job_id: request.job_id.as_str(),
+            request,
+            plan,
+            scenes,
+            reporter,
+            remastered,
+            loudness_chain,
+            working: plan.working_set.clone(),
+            chunk_encoding: options.chunk_encoding,
+            max_degrade_retries: options.max_degrade_retries,
+            workdir: scratch,
+        };
+        let outcome = executor.run(&context)?;
+        for message in &outcome.degradations {
+            reporter.warn(Some(Stage::Encode), message.clone());
+        }
+        reporter.stage(Stage::Encode, StageStatus::Done, None);
+        reporter.info(
+            Some(Stage::Encode),
+            format!(
+                "{} chunk(s) written, {} reused from a previous run, {} model call(s), \
+                 {} output frame(s) from {} input frame(s)",
+                outcome.chunks_written,
+                outcome.chunks_resumed,
+                outcome.model_calls,
+                outcome.output_frames,
+                outcome.input_frames
+            ),
+        );
+        reporter.stage(
+            Stage::Mux,
+            StageStatus::Done,
+            Some(format!(
+                "chunks concatenated with `-c:v {}` and muxed with {} audio, {} subtitle, \
+                 {} attachment stream(s), {} chapter(s)",
+                if outcome.chunk_encoding
+                    == crate::pipeline::native::ChunkEncoding::DirectFinalCodec
+                {
+                    "copy"
+                } else {
+                    plan.video.encoder.name.as_str()
+                },
+                if remastered.is_some() {
+                    plan.inventory.audio_streams + 1
+                } else {
+                    plan.inventory.audio_streams
+                },
+                plan.inventory.subtitle_streams,
+                plan.inventory.attachments,
+                plan.inventory.chapters
+            )),
+        );
+        Ok(outcome.output)
     }
 
     fn quality_check(
@@ -1170,6 +1384,11 @@ mod tests {
             },
             temporal_mode: crate::media::classify::TemporalMode::Progressive,
             temporal_note: "progressive".into(),
+            cadence: crate::pipeline::plan::CadencePlan::plan(
+                crate::media::classify::TemporalMode::Progressive,
+                Rational::new(24000, 1001).unwrap(),
+                true,
+            ),
             ivtc: false,
             deinterlace: None,
             target_width: 1440,
@@ -1185,8 +1404,11 @@ mod tests {
                 scene_cuts_respected: true,
                 note: "duplication".into(),
             },
+            executor: crate::pipeline::plan::VideoExecutor::FfmpegSinglePass,
+            inference: None,
             regrain_strength: 0.0,
             filter_chain: "scale=1440:960:flags=lanczos,framerate=fps=47.952048".into(),
+            decode_chain: String::new(),
             encoder: SelectedVideoEncoder {
                 name: "av1_nvenc".into(),
                 codec: VideoCodec::Av1,
