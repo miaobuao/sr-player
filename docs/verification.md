@@ -73,6 +73,56 @@ comparing consecutive frames distinguishes the two.
 The plan states the cut guarantee in its own words: *"2 cut(s) in this file are
 shot boundaries the interpolation is never allowed to cross"*.
 
+## Phase 3 — restoration, and both models together
+
+```powershell
+sr-cli convert testdata\sample-dvd.mkv -o <fresh path>.mkv `
+    --profile safe-16gb --interpolate rife --no-resume
+```
+
+```
+[interpolate] RIFE 4.25 open on NVIDIA GeForce RTX 5070 Ti (device 0, 14.9 GiB), ensemble off, 2x film mode
+[restore]     restoration open: 4x on NVIDIA GeForce RTX 5070 Ti (720x480 -> (2880, 1920) source raster 720x480)
+[plan]        240 input frame(s) to 479 output frame(s) in 3 chunk(s), 218 segment(s)
+```
+
+| property | value | expected |
+|---|---|---|
+| video frames | 479 | `2*(240-1)+1` |
+| geometry | 1620x1080 | target canvas |
+| duration | 8.005 s | source 8.01 s |
+| streams | av1, flac 6ch, ac3 6ch, ac3 2ch, subrip, ttf | all preserved |
+| adjacent frames | **0 of 12 identical** | a duplicating pass would show ~half |
+| wall clock | 749 s | 240 restores, 239 syntheses, 3 chunk encodes |
+
+### Restoration is a network, not a resampler
+
+The check that matters, and the one that would catch a regression to Lanczos: take
+the same source frame, upscale it to 1620x1080 with Lanczos, and compare the
+compressed size of that against the pipeline's output frame.
+
+| frame | PNG bytes |
+|---|---|
+| Lanczos 1620x1080 | 37,191 |
+| restored, after interpolation | 791,152 |
+
+A 21x difference. A resampler cannot invent high-frequency detail, so it compresses
+to almost nothing; a network that synthesises it does not. `restore_image_test`
+measures the same property in isolation (30.28 levels from a bilinear upscale), and
+this confirms it survives the whole product path.
+
+### Efficiency finding, not yet acted on
+
+Restoration produces 2880x1920 (4x of the 720x480 source) and the resize to the
+final 1620x1080 canvas happens in the encoder's post-chain, **after** RIFE. So the
+interpolator runs on 5.5 megapixels where the deliverable is 1.7 — 3.2x the work
+per frame, for 239 frames, which is most of the 749 seconds above.
+
+Resizing to the target canvas between restoration and interpolation would remove
+that, and it is what "exact deterministic target-canvas resizing" in the objective
+is asking for. It is also not purely an optimisation: it changes what RIFE sees, so
+it needs a quality comparison before being adopted rather than after.
+
 ## Defects found by doing the work above
 
 ### Fixed: a stored plan outlived the options that shaped it
