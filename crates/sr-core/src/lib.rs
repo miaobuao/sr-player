@@ -32,6 +32,7 @@
 //! | [`ai`] | the single native AI runtime: device enumeration, RIFE, Real-ESRGAN |
 //! | [`state`] | SQLite job store |
 
+pub mod ai;
 pub mod audio;
 pub mod error;
 pub mod events;
