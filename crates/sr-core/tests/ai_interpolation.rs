@@ -70,7 +70,9 @@ fn rife_synthesises_a_frame_through_the_rust_api() {
         return;
     }
 
-    let runtime = ai::Runtime::open_preferred().expect("a device that can host a model");
+    let runtime = std::sync::Arc::new(
+        ai::Runtime::open_preferred().expect("a device that can host a model"),
+    );
     println!("device: {} ({})", runtime.device().name, runtime.device().device_type.as_str());
     let mut rife = runtime
         .open_rife(&ai::rife_model_dir())

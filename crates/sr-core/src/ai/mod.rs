@@ -255,7 +255,7 @@ impl Runtime {
         &self.device
     }
 
-    pub fn open_rife(&self, model_dir: &Path) -> AiResult<Rife> {
+    pub fn open_rife(self: &Arc<Self>, model_dir: &Path) -> AiResult<Rife> {
         let dir = CString::new(model_dir.to_string_lossy().as_bytes())
             .map_err(|_| AiError::InvalidArgument("the model path contains a NUL".into()))?;
         let handle = unsafe { ffi::sr_rife_create(self.ctx, dir.as_ptr()) };
@@ -268,11 +268,11 @@ impl Runtime {
         }
         Ok(Rife {
             handle,
-            _ctx: self.ctx,
+            _runtime: Arc::clone(self),
         })
     }
 
-    pub fn open_restorer(&self, model_dir: &Path) -> AiResult<Restorer> {
+    pub fn open_restorer(self: &Arc<Self>, model_dir: &Path) -> AiResult<Restorer> {
         let dir = CString::new(model_dir.to_string_lossy().as_bytes())
             .map_err(|_| AiError::InvalidArgument("the model path contains a NUL".into()))?;
         let handle = unsafe { ffi::sr_restorer_create(self.ctx, dir.as_ptr()) };
@@ -285,7 +285,7 @@ impl Runtime {
         }
         Ok(Restorer {
             handle,
-            _ctx: self.ctx,
+            _runtime: Arc::clone(self),
         })
     }
 }
@@ -347,8 +347,12 @@ impl<'a> FrameView<'a> {
 /// rather than a filter setting a future edit could drop.
 pub struct Rife {
     handle: *mut ffi::sr_rife,
-    /// Keeps the context alive for at least as long as the model on it.
-    _ctx: *mut ffi::sr_context,
+    /// Owns the context, not merely a copy of its pointer.
+    ///
+    /// A bare pointer here would be a dangling handle the moment the caller's
+    /// `Runtime` went out of scope, and the failure would be a use-after-free
+    /// inside ncnn rather than a compile error.
+    _runtime: Arc<Runtime>,
 }
 
 // Safety: see `Runtime`. The handle is used by one thread at a time.
@@ -415,7 +419,7 @@ impl Rife {
         if code == ffi::SR_OK {
             Ok(())
         } else {
-            Err(AiError::from_code(code, self._ctx, "sr_rife_process"))
+            Err(AiError::from_code(code, self._runtime.ctx, "sr_rife_process"))
         }
     }
 }
@@ -433,7 +437,8 @@ impl Drop for Rife {
 /// this one without touching `sr-core` or reintroducing a framework.
 pub struct Restorer {
     handle: *mut ffi::sr_restorer,
-    _ctx: *mut ffi::sr_context,
+    /// See `Rife`: the model owns the context it runs on.
+    _runtime: Arc<Runtime>,
 }
 
 unsafe impl Send for Restorer {}
@@ -474,7 +479,7 @@ impl Restorer {
         if code == ffi::SR_OK {
             Ok(())
         } else {
-            Err(AiError::from_code(code, self._ctx, "sr_restorer_process"))
+            Err(AiError::from_code(code, self._runtime.ctx, "sr_restorer_process"))
         }
     }
 }
