@@ -29,6 +29,7 @@
 
 pub mod abi;
 pub mod engine;
+pub mod ifnet;
 pub mod kernels;
 
 use abi::*;
