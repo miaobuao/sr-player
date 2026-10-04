@@ -19,6 +19,7 @@
 //! Every stage checkpoints its result, and every stage reports what it did to the
 //! event bus, so the UI never has to guess.
 
+pub mod grain;
 pub mod native;
 pub mod plan;
 pub mod policy;
