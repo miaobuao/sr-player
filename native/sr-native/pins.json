@@ -11,6 +11,21 @@
     "file. All hashes below were computed on the RTX 5070 Ti reference machine."
   ],
 
+  "build": {
+    "_comment": [
+      "The toolchain this was built and verified with. Recorded because 'it builds'",
+      "is not a property of the source alone: MSVC's code page needed /utf-8, ncnn's",
+      "release is built against a specific VS toolset, and a different compiler",
+      "version is a different binary with different floating-point behaviour."
+    ],
+    "rustc": "1.98.0 (88d9e12ae 2026-08-18)",
+    "cmake": "4.3.1-msvc1",
+    "msvc_toolset": "14.51.36231",
+    "visual_studio": "18 Community",
+    "windows_sdk_note": "the Vulkan import library is generated from the system loader, so no SDK is required",
+    "verified_at_commit": "8cbf25a"
+  },
+
   "ncnn": {
     "repository": "https://github.com/Tencent/ncnn",
     "tag": "20260526",
@@ -117,7 +132,14 @@
         }
       },
       "scale": 4,
-      "license": "MIT",
+      "license": "BSD-3-Clause",
+      "_license_correction": [
+        "Recorded as MIT when this file was written, from the repository's general",
+        "reputation rather than from its text. Fetching the actual LICENSE for",
+        "third_party/LICENSES/ showed BSD-3-Clause, which carries a non-endorsement",
+        "clause MIT does not. A redistributor relying on the old value would have been",
+        "relying on a term nobody granted."
+      ],
       "verified": "restore_image_test passes: luminance preserved, output differs from a bilinear upscale by 30.28 levels, tiled and untiled agree to 5.16 levels"
     }
   },
