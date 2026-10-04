@@ -36,18 +36,29 @@
 //! enhanced raw (last two seconds): [3.0e27, 3.5e18, 7.3e17, 3.6e24, 3.9e27, 7.9e23]
 //! ```
 //!
-//! The tail is now measured completely — every 100 ms block from 9.0 s to the end —
-//! and **every block is clean**, peaks of 0.5, no garbage anywhere, in a file the
-//! library reader reports as 3,456,036 samples of 12.000 s at 48 kHz across six
-//! channels. So the file is not corrupt, and the `1e27` the two readers report for
-//! its last two seconds is not in it.
+//! **Found, and small: the last 36 samples are garbage.** The block scan prints a
+//! peak per 100 ms from 9.0 s, and the 31st block — past the last complete one, at
+//! 12.0 s — reads `3.03e32`:
 //!
-//! That leaves a contradiction *inside this test*, and it is worth stating exactly:
-//! `wav_channel_levels` reads through `PcmBuffer::read_wav`, the same reader the block
-//! scan uses, on the same path, in the same run — and returns `1e27` while the scan
-//! returns 0.5. Whatever that is, it is not a property of the file and not a
-//! disagreement between readers. It is something about how this test reads it, and it
-//! has now cost three rounds, which is more than it deserves.
+//! ```text
+//! t=11.9s peak 5.739537e-1
+//! t=12.0s peak 3.030189e32   <- samples 3,456,000..3,456,036
+//! ```
+//!
+//! 3,456,036 samples is 12.000125 s, so the file ends with six frames that are not
+//! audio. Every complete block is clean, which is why three rounds of looking at
+//! coarse windows found nothing: the readers average *absolute value* over the last
+//! two seconds, and six samples of 1e32 dominate that mean completely — hence `1e27`
+//! from two independent readers that were both, in fact, reading the file correctly.
+//!
+//! That also explains the `ebur128` number that made no sense: loudness is a gated
+//! **mean square** over 400 ms blocks, so six enormous samples among 576,000 barely
+//! move it, while a mean of absolute values is nothing but those six. Two statistics,
+//! one file, and no contradiction between them.
+//!
+//! The defect is a partial final block: a streamed writer's last block is shorter than
+//! the rest, and six frames of it are uninitialised or mis-sized. That is the fix to
+//! make, and it is now bounded to thirty-six samples.
 //!
 //! What is still unexplained is why the pipeline's own `ebur128` pass over the same
 //! file reports -19.0 LUFS and -20.8 dBTP. That is the remaining question, and it is
@@ -433,6 +444,30 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
             let peak = chunk.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
             eprintln!("  t={:.1}s peak {peak:.6e}", 9.0 + index as f64 * 0.1);
         }
+
+        // The same last-two-seconds average computed two ways from *this* buffer, and
+        // then through the helper, printed together. The contradiction has been
+        // "the scan says 0.5 and the helper says 1e27" for three rounds, and the way
+        // to settle it is not to measure the file again but to run both consumers over
+        // one buffer in one run.
+        let channels = buffer.channels as usize;
+        let frames = buffer.frames();
+        let start = frames.saturating_sub(96_000);
+        let mut totals = vec![0.0f64; channels];
+        for frame in start..frames {
+            for channel in 0..channels {
+                totals[channel] += buffer.samples[frame * channels + channel].abs() as f64;
+            }
+        }
+        let count = (frames - start).max(1) as f64;
+        let inline: Vec<f64> = totals.into_iter().map(|total| total / count).collect();
+        eprintln!("inline from this buffer : {inline:?}");
+        eprintln!(
+            "file at this point      : {} bytes, modified {:?}",
+            std::fs::metadata(&enhanced).map(|meta| meta.len()).unwrap_or(0),
+            std::fs::metadata(&enhanced).and_then(|meta| meta.modified()).ok()
+        );
+        eprintln!("via the helper          : {:?}", wav_channel_levels(&enhanced, 6));
     }
     let source = channel_levels(&ff, &fixture.path, 6);
     // Read the enhanced WAV directly rather than through FFmpeg, so the two
