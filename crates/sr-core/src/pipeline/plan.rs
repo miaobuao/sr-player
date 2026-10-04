@@ -1269,16 +1269,34 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_restoration_is_refused_rather_than_resampled() {
+    fn a_request_for_restoration_is_served_or_refused_without_a_resample() {
+        // Phase 0 wrote this as "must be refused". What it was really asserting --
+        // that a resample is never offered as the alternative -- still holds and is
+        // still checked below. What changed is that the runtime now exists, so on a
+        // machine with the weights and a device this resolves.
         let settings = RestorationProfile::safe_16gb().restoration;
-        let err = require_restoration_runtime(&settings)
-            .expect_err("the default profile asks for Real-ESRGAN and nothing can serve it");
-        let text = err.to_string();
-        assert!(text.contains("RealESRGAN_x4plus"), "{text}");
-        assert!(
-            !text.contains("Lanczos resample to the target"),
-            "the refusal must not present a resample as the alternative: {text}"
-        );
+        match require_restoration_runtime(&settings) {
+            Ok(()) => {}
+            Err(err) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("weights are not installed") || text.contains("Vulkan device"),
+                    "a refusal must name what is missing rather than what is absent from the \
+                     build: {text}"
+                );
+            }
+        }
+
+        // In neither branch may a resample be presented as the way to get
+        // restoration. That is the assertion this test exists for, and it is the
+        // one the previous build failed.
+        if let Err(err) = require_restoration_runtime(&settings) {
+            let text = err.to_string();
+            assert!(
+                !text.contains("Lanczos resample to the target"),
+                "the refusal must not present a resample as the alternative: {text}"
+            );
+        }
 
         // Turning it off is the supported configuration, and it must not error.
         let off = RestorationSettings {
