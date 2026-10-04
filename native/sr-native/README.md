@@ -65,6 +65,12 @@ Nothing here floats, and `pins.json` is the record.
 * Model weights are downloaded, never committed — `.gitignore` excludes `models/`.
   `pins.json` records where each came from and what it hashed to, so the
   directory is reproducible rather than merely present.
+* The **licence texts themselves** are in
+  [`third_party/LICENSES/`](third_party/LICENSES/), with a README saying what ships
+  under what terms. ncnn is not vendored as source but is linked *statically*,
+  which puts its code inside this program's binary and makes its text a shipping
+  requirement rather than a courtesy. Real-ESRGAN is BSD-3-Clause, not MIT as an
+  earlier revision of `pins.json` claimed; the correction is recorded there.
 
 ## How the models are stored
 
