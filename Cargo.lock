@@ -5342,6 +5342,7 @@ dependencies = [
  "clap",
  "serde_json",
  "sr-core",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
