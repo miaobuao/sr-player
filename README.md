@@ -104,6 +104,21 @@ never through a temporary PNG and never through a child process.
 
 ## Quick start
 
+**The AI runtime is part of the build, so it has to be staged first.** A fresh
+clone cannot `cargo build` until this has run once:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File native\sr-native\setup-third-party.ps1
+```
+
+That downloads the pinned ncnn, generates a Vulkan import library from the system
+loader, stages both sets of weights, and verifies every SHA256 against
+`native/sr-native/pins.json`. `cargo build` then compiles and links the C++ itself.
+
+There is deliberately no feature flag to skip it. A build that compiled the AI
+stages out would still print "restoration" in its own logs while resampling with
+Lanczos, which is the specific dishonesty this architecture exists to prevent.
+
 ```powershell
 cargo build --release
 cargo run -p sr-cli -- profiles

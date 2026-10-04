@@ -485,17 +485,39 @@ impl Drop for Restorer {
     }
 }
 
-/// The models directory, resolved once.
+/// The models directory.
 ///
-/// `SR_MODELS_DIR` overrides it, which is what the tests and a packaged build
-/// both need.
+/// Resolved in three steps, because "next to the executable" is right for a
+/// packaged build and wrong for a `cargo test`, whose working directory is the
+/// crate root rather than the workspace root:
+///
+/// 1. `SR_MODELS_DIR`, which is what a deployment and the tests both set;
+/// 2. `models/` beside the executable;
+/// 3. the workspace's own `models/`, baked in at compile time.
+///
+/// The order matters: an installed build must never pick up a developer's
+/// workspace models by accident.
 pub fn models_root() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("SR_MODELS_DIR") {
         if !dir.is_empty() {
             return std::path::PathBuf::from(dir);
         }
     }
-    std::path::PathBuf::from("models")
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("models");
+            if beside.is_dir() {
+                return beside;
+            }
+        }
+    }
+
+    // crates/sr-core -> the workspace root.
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("models")
 }
 
 pub fn rife_model_dir() -> std::path::PathBuf {
