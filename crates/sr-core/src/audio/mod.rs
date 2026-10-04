@@ -109,11 +109,33 @@ pub fn remaster_to_wav(
     let block_frames = (rate as usize / 10).max(1);
     let mut frames_written: u64 = 0;
     let mut last_report = std::time::Instant::now();
+    // How much audio the container says there is.
+    //
+    // Measured: the decode returns six frames *more* than the source contains — of
+    // uninitialised memory — at the end of a twelve-second file whose tail is
+    // otherwise clean. `next_block` cannot be the source of those samples (it
+    // allocates a zeroed buffer and truncates to whole frames), so the padding comes
+    // from the decode, and a decoder padding its output must not be able to append
+    // rubbish to a published film. The rule is the one an unattended pipeline needs:
+    // write what the source declares and no more, and say so when something tries.
+    let declared_frames = (manifest.content_duration_seconds() * rate as f64).round() as u64;
+    let mut dropped_frames: u64 = 0;
 
     loop {
         let mut block = reader.next_block(block_frames, cancel)?;
         if block.is_empty() {
             break;
+        }
+        if declared_frames > 0 {
+            let available = (block.len() / channels as usize) as u64;
+            if frames_written + available > declared_frames {
+                let keep = declared_frames.saturating_sub(frames_written) as usize;
+                dropped_frames += available - keep as u64;
+                block.truncate(keep * channels as usize);
+                if block.is_empty() {
+                    break;
+                }
+            }
         }
         if let Some(processor) = processor.as_mut() {
             processor.process_block(&mut block);
@@ -144,6 +166,17 @@ pub fn remaster_to_wav(
         }
     }
     reader.finish()?;
+    if dropped_frames > 0 {
+        reporter.warn(
+            Some(Stage::AudioProcess),
+            format!(
+                "the decoder produced {dropped_frames} frame(s) beyond the {:.3}s the \
+                 container declares; they were not written, because audio past the end \
+                 of the source is not audio",
+                declared_frames as f64 / rate as f64
+            ),
+        );
+    }
     let applied = processor.is_some();
     let (max_gain_db, max_duck_db) = if applied {
         (

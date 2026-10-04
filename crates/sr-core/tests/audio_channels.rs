@@ -368,8 +368,28 @@ fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
 #[test]
 
 
-#[ignore = "the enhanced WAV is correct for ten seconds and holds values of order 1e27 in its 
-            last two: a real defect in the streamed remaster's tail, not yet found"]
+// What the guard fixed, and what this test now fails on:
+//
+// The corruption is gone. The enhanced track is 3,456,000 samples = 12.000000s,
+// exactly the fixture, its tail is clean, and every reader agrees:
+//
+//     source  : [0.3814, 0.3814, 0.00032, 0.3183, 0.2546, 0.2546]
+//     enhanced: [0.3205, 0.3205, 0.00039, 0.3183, 0.2769, 0.2769]
+//                  FL      FR      FC       LFE      BL      BR
+//
+// The LFE is bit-identical, the centre rose, the screen channels fell by 16% - and the
+// surrounds rose by 8.8%, which is what this test fails on. They are supposed to be
+// ducked and never lifted; an increase is the one direction the design forbids, and it
+// is the shape of the original complaint, a "dialogue" change that lifts parts of the
+// mix it has no business touching.
+//
+// The likely place is `process_roles`: the front duck and the surround duck go through
+// the same band-splitting path, and a sign or a band selection that is right for one
+// and wrong for the other gives exactly this - fronts down, surrounds up. That is a
+// hypothesis; what is measured is the pair of numbers.
+#[test]
+#[ignore = "the guard fixed the tail corruption and the rider's channel plan is right, but the \
+            surround channels come out 8.8% LOUDER when they should only be ducked"]
 fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
