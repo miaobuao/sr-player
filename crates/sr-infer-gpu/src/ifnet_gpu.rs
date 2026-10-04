@@ -31,12 +31,12 @@ struct Params {
     in_ch: u32,
     out_ch: u32,
     divisor: f32,
-    // Explicit scalars rather than a vector: `vec3<f32>` aligns to 16 in WGSL, so
-    // a `vec3` here makes the shader's struct 48 bytes against the host's 32 and
-    // every bind group is rejected for being too small.
+    // The input's size, which is the output's for every operator except `interp`.
+    // The shader's copy has the same eight 4-byte fields, so the two layouts are
+    // 32 bytes and cannot drift.
+    src_width: f32,
+    src_height: f32,
     pad0: f32,
-    pad1: f32,
-    pad2: f32,
 };
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -159,6 +159,42 @@ fn concat(@builtin(global_invocation_id) id: vec3<u32>) {
         output[id.x] = aux[pixel * second_ch + (channel - first_ch)];
     }
 }
+
+// Bilinear resize, matching the reference's pixel-centre convention exactly: an
+// exact 2x downsample has to sample the same points, or the pyramid's levels
+// disagree with the reference by a fraction of a pixel that grows with depth.
+fn src_at(x: i32, y: i32, channel: u32) -> f32 {
+    return input[(u32(y) * u32(params.src_width) + u32(x)) * params.in_ch + channel];
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn interp(@builtin(global_invocation_id) id: vec3<u32>) {
+    let count = params.width * params.height * params.in_ch;
+    if (id.x >= count) {
+        return;
+    }
+    let pixel = id.x / params.in_ch;
+    let channel = id.x % params.in_ch;
+    let x = pixel % params.width;
+    let y = pixel / params.width;
+    let scale_x = params.src_width / f32(params.width);
+    let scale_y = params.src_height / f32(params.height);
+    let sx = max((f32(x) + 0.5) * scale_x - 0.5, 0.0);
+    let sy = max((f32(y) + 0.5) * scale_y - 0.5, 0.0);
+    let x0 = floor(sx);
+    let y0 = floor(sy);
+    let fx = sx - x0;
+    let fy = sy - y0;
+    let last_x = i32(params.src_width) - 1;
+    let last_y = i32(params.src_height) - 1;
+    let ix0 = min(i32(x0), last_x);
+    let iy0 = min(i32(y0), last_y);
+    let ix1 = min(i32(x0) + 1, last_x);
+    let iy1 = min(i32(y0) + 1, last_y);
+    let top = src_at(ix0, iy0, channel) * (1.0 - fx) + src_at(ix1, iy0, channel) * fx;
+    let bottom = src_at(ix0, iy1, channel) * (1.0 - fx) + src_at(ix1, iy1, channel) * fx;
+    output[id.x] = top * (1.0 - fy) + bottom * fy;
+}
 "#;
 
 /// One dispatch's uniform block. The layout must match `Params` in the shader.
@@ -170,11 +206,12 @@ struct Params {
     in_ch: u32,
     out_ch: u32,
     divisor: f32,
-    // Three scalars, not `[f32; 3]` behind a vector: the shader's copy has the
-    // same eight 4-byte fields, so the two layouts are 32 bytes and cannot drift.
+    // The operand's size, which is the output's for every operator except
+    // `interp`. Eight 4-byte fields in the shader's copy too, so the two layouts
+    // are 32 bytes and cannot drift.
+    src_width: f32,
+    src_height: f32,
     pad0: f32,
-    pad1: f32,
-    pad2: f32,
 }
 
 impl Params {
@@ -185,10 +222,17 @@ impl Params {
             in_ch: in_ch as u32,
             out_ch: out_ch as u32,
             divisor,
+            src_width: width as f32,
+            src_height: height as f32,
             pad0: 0.0,
-            pad1: 0.0,
-            pad2: 0.0,
         }
+    }
+
+    /// The operand's size, for the operators where it differs from the output's.
+    fn with_source(mut self, width: usize, height: usize) -> Self {
+        self.src_width = width as f32;
+        self.src_height = height as f32;
+        self
     }
 }
 
@@ -201,6 +245,7 @@ pub struct GpuOps {
     warp: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     concat: wgpu::ComputePipeline,
+    interp: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -252,6 +297,7 @@ impl GpuOps {
         let warp = pipeline("warp");
         let add = pipeline("add");
         let concat = pipeline("concat");
+        let interp = pipeline("interp");
         Ok(GpuOps {
             device,
             queue,
@@ -260,6 +306,7 @@ impl GpuOps {
             warp,
             add,
             concat,
+            interp,
         })
     }
 
@@ -541,10 +588,27 @@ impl GpuOps {
                     shapes.insert(top, (width, height, channels));
                 }
                 "Interp" => {
-                    return Err(ModelError::Shape(format!(
-                        "layer `{}`: interpolation is not ported to the device yet",
-                        layer.name
-                    )))
+                    let (input, (src_width, src_height, channels)) = bottom(0)?;
+                    let input = input.clone();
+                    let width = layer.option(0).unwrap_or(src_width as i32).max(1) as usize;
+                    let height = layer.option(1).unwrap_or(src_height as i32).max(1) as usize;
+                    let output = self.empty(width * height * channels);
+                    let params = self
+                        .uniform(
+                            Params::new(width, height, channels, channels, 1.0)
+                                .with_source(src_width, src_height),
+                        );
+                    self.dispatch_single(
+                        &mut encoder,
+                        &self.interp,
+                        "interp",
+                        &input,
+                        &output,
+                        &params,
+                        width * height * channels,
+                    );
+                    blobs.insert(top.clone(), output);
+                    shapes.insert(top, (width, height, channels));
                 }
                 other => {
                     return Err(ModelError::Shape(format!(
@@ -613,6 +677,50 @@ impl GpuOps {
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             })
+    }
+
+    /// One dispatch of a kernel that takes a single storage input.
+    ///
+    /// `interp` needs its own because wgpu derives the bind group layout *per entry
+    /// point*: a kernel that never mentions the second binding has a three-binding
+    /// layout, and supplying four entries is a validation error rather than a
+    /// harmless extra.
+    fn dispatch_single(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        label: &str,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+        count: usize,
+    ) {
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups((count as u32).div_ceil(64), 1, 1);
+        drop(pass);
     }
 
     /// One dispatch of a kernel that takes two storage inputs: the binding order
@@ -717,7 +825,7 @@ pub fn unsupported_on_device(model: &Model) -> Vec<String> {
         .filter(|layer| {
             !matches!(
                 layer.kind.as_str(),
-                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp"
+                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp" | "Interp"
             )
         })
         .map(|layer| format!("{} ({})", layer.kind, layer.name))
@@ -777,6 +885,70 @@ mod tests {
             graph: parse_param(&text).expect("parse"),
             weights,
         }
+    }
+
+    /// The resize must agree with the reference in both directions. A pyramid
+    /// upsamples and downsamples repeatedly, so a half-pixel disagreement here
+    /// compounds with depth rather than cancelling.
+    #[test]
+    fn the_device_resize_matches_the_reference_in_both_directions() {
+        let Some(ops) = ops_or_skip() else {
+            return;
+        };
+        let graph = model(
+            "Input            a        0 1 a\n\
+             Interp           down     1 1 a small 0=7 1=5\n\
+             Interp           up       1 1 small big 0=21 1=15\n",
+            Vec::new(),
+        );
+        let input = gradient(21, 15, 3, 0.3);
+        let gpu = ops.forward(&graph, &input, &input).expect("forward");
+        let cpu = graph.forward(&input, &input).expect("forward");
+        assert_eq!((gpu.width, gpu.height, gpu.channels), (21, 15, 3));
+        let worst = gpu
+            .data
+            .iter()
+            .zip(cpu.data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-4,
+            "the device's resize must match the reference; worst difference {worst}"
+        );
+    }
+
+    /// The whole three-level pyramid on the device, with the same invariant as the
+    /// single-stage graph: no flow anywhere means the average of the two frames.
+    ///
+    /// This is the multi-scale wiring checked end to end on the device — six
+    /// resizes, two full-resolution warps, the flow refinement and the fusion.
+    #[test]
+    fn a_zero_flow_pyramid_on_the_device_is_a_blend() {
+        let Some(ops) = ops_or_skip() else {
+            return;
+        };
+        let (width, height, channels) = (24, 16, 3);
+        let graph = crate::ifnet::pyramid(width, height, channels, 4);
+        assert!(
+            unsupported_on_device(&graph).is_empty(),
+            "the device must run the whole pyramid: {:?}",
+            unsupported_on_device(&graph)
+        );
+        let a = gradient(width, height, channels, 0.2);
+        let b = gradient(width, height, channels, 0.7);
+        let gpu = ops.forward(&graph, &a, &b).expect("forward on the device");
+        assert_eq!((gpu.width, gpu.height, gpu.channels), (width, height, channels));
+        let expected = crate::ifnet::blend(&a, &b, 0.5);
+        let worst = gpu
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "a pyramid with no flow must be a blend on the device too; worst difference {worst}"
+        );
     }
 
     fn gradient(width: usize, height: usize, channels: usize, base: f32) -> Planar {
@@ -926,13 +1098,29 @@ mod tests {
         assert!(column(2) < 0.01, "and it must have left x=2");
     }
 
+    /// A layer the device cannot run must be named, not approximated.
+    ///
+    /// The list is deliberately shorter than the CPU reference's: the device
+    /// implements fewer layers, and a model that runs on one and not the other has
+    /// to say so rather than produce a frame with a stage missing.
     #[test]
     fn a_layer_the_device_cannot_run_is_reported_by_name() {
         let graph = model(
             "Input            a        0 1 a\n\
-             Interp           up       1 1 a out 0=16 1=16\n",
+             BinaryOp         mul      1 1 a out 0=0\n",
             Vec::new(),
         );
-        assert_eq!(unsupported_on_device(&graph), vec!["Interp (up)".to_string()]);
+        assert_eq!(
+            unsupported_on_device(&graph),
+            vec!["BinaryOp (mul)".to_string()]
+        );
+        // And the pyramid must not be on that list, or the multi-scale device test
+        // would be measuring nothing.
+        let pyramid = crate::ifnet::pyramid(16, 16, 3, 4);
+        assert!(
+            unsupported_on_device(&pyramid).is_empty(),
+            "{:?}",
+            unsupported_on_device(&pyramid)
+        );
     }
 }

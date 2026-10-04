@@ -259,7 +259,162 @@ impl Model {
             .iter()
             .all(|layer| matches!(layer.kind.as_str(), "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp"))
     }
+}
 
+/// Builds a three-level coarse-to-fine interpolation network.
+///
+/// This is the topology that separates a learnt interpolator from a block matcher:
+/// flow is estimated at a quarter resolution first, where a large displacement is
+/// a few pixels and a convolution can see it, then refined at half and full
+/// resolution with the coarser estimate upsampled and fed back in. Warping happens
+/// at full resolution, where the result is used.
+///
+/// The graph is emitted rather than written as text so the weight offsets cannot
+/// drift from the layer list: each layer's weights are appended as the layer is
+/// built, and the total is whatever was appended.
+///
+/// Two honest notes about the topology:
+///
+/// * the fusion head is initialised to the average of the two warped frames and
+///   every other weight is zero. A real checkpoint would replace all of it; with
+///   these weights the network is an elaborate way to average two frames, which is
+///   exactly what makes it verifiable — see the test;
+/// * the upsampled flow is added to the refinement rather than scaled by two
+///   first. The scale is what the real network does and there is no
+///   scalar-multiply operator yet, so the refinement as built is slightly
+///   under-weighted. It is the next operator to add, and with zero weights it
+///   makes no difference at all.
+pub fn pyramid(width: usize, height: usize, channels: usize, features: usize) -> Model {
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut weights: Vec<f32> = Vec::new();
+    let mut blobs = 0usize;
+    let mut push = |layer: Layer| {
+        blobs += layer.tops.len();
+        layers.push(layer);
+    };
+    let conv = |name: &str, from: &str, to: &str, out_ch: usize, in_ch: usize, weights: &mut Vec<f32>| {
+        let mut options = HashMap::new();
+        options.insert(0u32, out_ch as i32);
+        options.insert(1u32, 3);
+        options.insert(7u32, in_ch as i32);
+        weights.extend(std::iter::repeat(0.0).take(out_ch * in_ch * 9 + out_ch));
+        Layer {
+            kind: "Convolution".into(),
+            name: name.into(),
+            bottoms: vec![from.into()],
+            tops: vec![to.into()],
+            options,
+        }
+    };
+    let prelu = |name: &str, from: &str, to: &str, channels: usize, weights: &mut Vec<f32>| {
+        let mut options = HashMap::new();
+        options.insert(0u32, channels as i32);
+        weights.extend(std::iter::repeat(0.0).take(channels));
+        Layer {
+            kind: "PReLU".into(),
+            name: name.into(),
+            bottoms: vec![from.into()],
+            tops: vec![to.into()],
+            options,
+        }
+    };
+    let interp = |name: &str, from: &str, to: &str, w: usize, h: usize| {
+        let mut options = HashMap::new();
+        options.insert(0u32, w as i32);
+        options.insert(1u32, h as i32);
+        Layer {
+            kind: "Interp".into(),
+            name: name.into(),
+            bottoms: vec![from.into()],
+            tops: vec![to.into()],
+            options,
+        }
+    };
+    let concat = |name: &str, first: &str, second: &str, to: &str| Layer {
+        kind: "Concat".into(),
+        name: name.into(),
+        bottoms: vec![first.into(), second.into()],
+        tops: vec![to.into()],
+        options: HashMap::new(),
+    };
+    let warp = |name: &str, frame: &str, flow: &str, to: &str| {
+        let mut options = HashMap::new();
+        options.insert(0u32, 2);
+        Layer {
+            kind: "Warp".into(),
+            name: name.into(),
+            bottoms: vec![frame.into(), flow.into()],
+            tops: vec![to.into()],
+            options,
+        }
+    };
+
+    push(Layer {
+        kind: "Input".into(),
+        name: "input0".into(),
+        bottoms: Vec::new(),
+        tops: vec!["a".into()],
+        options: HashMap::new(),
+    });
+    push(Layer {
+        kind: "Input".into(),
+        name: "input1".into(),
+        bottoms: Vec::new(),
+        tops: vec!["b".into()],
+        options: HashMap::new(),
+    });
+
+    // ---- coarsest level: a quarter resolution -----------------------------
+    let (w4, h4) = ((width / 4).max(2), (height / 4).max(2));
+    push(interp("down_a4", "a", "a4", w4, h4));
+    push(interp("down_b4", "b", "b4", w4, h4));
+    push(concat("cat4", "a4", "b4", "pair4"));
+    push(conv("enc4", "pair4", "enc4", features, channels * 2, &mut weights));
+    push(prelu("enc4r", "enc4", "enc4r", features, &mut weights));
+    push(conv("flow4", "enc4r", "flow4", 2, features, &mut weights));
+
+    // ---- middle level: half resolution, refined by the coarse flow --------
+    let (w2, h2) = ((width / 2).max(2), (height / 2).max(2));
+    push(interp("down_a2", "a", "a2", w2, h2));
+    push(interp("down_b2", "b", "b2", w2, h2));
+    push(interp("up_flow4", "flow4", "flow4_up", w2, h2));
+    push(concat("cat2ab", "a2", "b2", "pair2"));
+    push(concat("cat2", "pair2", "flow4_up", "enc2_in"));
+    push(conv("enc2", "enc2_in", "enc2", features, channels * 2 + 2, &mut weights));
+    push(prelu("enc2r", "enc2", "enc2r", features, &mut weights));
+    push(conv("delta2", "enc2r", "delta2", 2, features, &mut weights));
+    push(Layer {
+        kind: "Add".into(),
+        name: "flow2".into(),
+        bottoms: vec!["flow4_up".into(), "delta2".into()],
+        tops: vec!["flow2".into()],
+        options: HashMap::new(),
+    });
+
+    // ---- finest level: full resolution, where the answer is used ----------
+    push(interp("up_flow2", "flow2", "flow2_up", width, height));
+    push(warp("warpa", "a", "flow2_up", "warpa"));
+    push(warp("warpb", "b", "flow2_up", "warpb"));
+    push(concat("cat1", "warpa", "warpb", "joined"));
+    let fusion_at = weights.len();
+    push(conv("fusion", "joined", "out", channels, channels * 2, &mut weights));
+    // The fusion averages its two halves; everything else stays zero.
+    for output in 0..channels {
+        for input in [output, output + channels] {
+            weights[fusion_at + output * channels * 2 * 9 + input * 9 + 4] = 0.5;
+        }
+    }
+
+    Model {
+        graph: Graph {
+            layers,
+            weight_count: weights.len(),
+        },
+        weights,
+    }
+}
+
+impl Model {
     /// The layers this module cannot run, so a caller can say which.
     pub fn unsupported(&self) -> Vec<String> {
         let mut names: Vec<String> = self
@@ -871,8 +1026,8 @@ mod tests {
         let model = Model::load(&param_path).expect("load");
         assert!(model.is_runnable(), "unsupported: {:?}", model.unsupported());
 
-        let a = gradient(8, 8, 0.25);
-        let b = gradient(8, 8, 0.75);
+        let a = gradient(8, 8, 3, 0.25);
+        let b = gradient(8, 8, 3, 0.75);
         let output = model.forward(&a, &b).expect("forward");
         assert_eq!((output.width, output.height, output.channels), (8, 8, 3));
 
@@ -909,11 +1064,90 @@ mod tests {
         );
     }
 
-    fn gradient(width: usize, height: usize, base: f32) -> Planar {
-        let mut frame = Planar::new(width, height, 3);
+    /// The pyramid's structure: three scales, flow refined at each, and warping
+    /// only where the answer is used.
+    #[test]
+    fn the_pyramid_is_coarse_to_fine() {
+        let model = pyramid(32, 24, 3, 4);
+        assert!(model.is_runnable(), "unsupported: {:?}", model.unsupported());
+        let kinds: Vec<&str> = model
+            .graph
+            .layers
+            .iter()
+            .map(|layer| layer.kind.as_str())
+            .collect();
+        let count = |kind: &str| kinds.iter().filter(|entry| **entry == kind).count();
+        assert_eq!(count("Input"), 2, "two frames in");
+        // Four resizes: both frames down to each of two coarse levels, and the two
+        // flow fields back up.
+        assert_eq!(count("Interp"), 6, "the pyramid needs six resizes: {kinds:?}");
+        assert_eq!(count("Warp"), 2, "both frames warp at full resolution");
+        // Coarse flow, then a delta added to its upsampled version.
+        assert_eq!(count("Convolution"), 5);
+        assert_eq!(count("Add"), 1);
+        assert_eq!(
+            model.graph.layers.last().map(|layer| layer.kind.as_str()),
+            Some("Convolution"),
+            "the fusion head is last"
+        );
+        // The declared weight count must match what the layers consume, or the
+        // cursor walks off the end when the model runs.
+        let mut cursor = 0usize;
+        for layer in &model.graph.layers {
+            cursor += match layer.kind.as_str() {
+                "Convolution" => {
+                    let out = layer.num_output().unwrap_or(0);
+                    let input = layer.option(7).unwrap_or(0) as usize;
+                    out * input * 9 + out
+                }
+                "PReLU" => layer.num_output().unwrap_or(0),
+                _ => 0,
+            };
+        }
+        assert_eq!(
+            cursor,
+            model.weights.len(),
+            "the weights must be exactly what the layers read"
+        );
+    }
+
+    /// The invariant at every scale: with every flow-producing weight zero, the
+    /// whole pyramid must reduce to the average of the two frames.
+    ///
+    /// This is what makes the multi-scale wiring checkable without a checkpoint.
+    /// Every resize, both warps, the concatenations, the flow refinement and the
+    /// fusion all have to be right for it to hold; a single mis-sized level or an
+    /// upsample that lands half a pixel off shows up as a difference.
+    #[test]
+    fn a_zero_flow_pyramid_is_exactly_a_blend() {
+        let (width, height, channels) = (24, 16, 3);
+        let model = pyramid(width, height, channels, 4);
+        let a = gradient(width, height, channels, 0.2);
+        let b = gradient(width, height, channels, 0.7);
+        let output = model.forward(&a, &b).expect("forward");
+        assert_eq!(
+            (output.width, output.height, output.channels),
+            (width, height, channels),
+            "the pyramid must return a frame the size it was given"
+        );
+        let expected = blend(&a, &b, 0.5);
+        let worst = output
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "a pyramid with no flow must be a blend; worst difference {worst}"
+        );
+    }
+
+    fn gradient(width: usize, height: usize, channels: usize, base: f32) -> Planar {
+        let mut frame = Planar::new(width, height, channels);
         for y in 0..height {
             for x in 0..width {
-                for channel in 0..3 {
+                for channel in 0..channels {
                     frame.set(
                         channel,
                         x,
