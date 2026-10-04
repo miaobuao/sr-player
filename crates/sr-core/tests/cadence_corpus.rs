@@ -57,9 +57,15 @@ fn example_plugin() -> Option<PathBuf> {
     } else {
         "libsr_infer_plugin_example.so"
     };
+    // Both paths are legitimate cargo outputs, and *which one is current depends on
+    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
+    // building it as a dependency writes `deps/`. Taking the first that existed loaded
+    // a stale binary and silently invalidated a test - the injected fault was in the
+    // newer file and never ran, and the test could not tell.
     [dir.join(name), dir.join("deps").join(name)]
         .into_iter()
-        .find(|path| path.exists())
+        .filter(|path| path.exists())
+        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
 }
 
 /// Which `TemporalMode` the classifier reports, and what it based that on.

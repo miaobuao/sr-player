@@ -49,9 +49,15 @@ fn example_plugin() -> Option<PathBuf> {
     } else {
         "libsr_infer_plugin_example.so"
     };
+    // Both paths are legitimate cargo outputs, and *which one is current depends on
+    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
+    // building it as a dependency writes `deps/`. Taking the first that existed loaded
+    // a stale binary and silently invalidated a test - the injected fault was in the
+    // newer file and never ran, and the test could not tell.
     [dir.join(name), dir.join("deps").join(name)]
         .into_iter()
-        .find(|path| path.exists())
+        .filter(|path| path.exists())
+        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
 }
 
 /// Four one-second shots, so there are several chunks and a failed one is not the
@@ -171,8 +177,6 @@ fn run(
 }
 
 #[test]
-#[ignore = "the injected chunk failure does not fire: with the retry budget at zero the run 
-            still completes, so this test cannot yet show that the retry is what saves it"]
 fn a_chunk_that_fails_once_is_retried_and_the_film_is_unchanged() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;

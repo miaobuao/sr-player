@@ -57,9 +57,15 @@ fn example_plugin() -> Option<PathBuf> {
     } else {
         "libsr_infer_plugin_example.so"
     };
+    // Both paths are legitimate cargo outputs, and *which one is current depends on
+    // how it was last built*: `cargo build -p <plugin>` writes `target/debug/`, while
+    // building it as a dependency writes `deps/`. Taking the first that existed loaded
+    // a stale binary and silently invalidated a test - the injected fault was in the
+    // newer file and never ran, and nothing said so.
     [dir.join(name), dir.join("deps").join(name)]
         .into_iter()
-        .find(|p| p.exists())
+        .filter(|p| p.exists())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|meta| meta.modified()).ok())
 }
 
 /// Three one-second shots at 24 fps with hard cuts at 1.0 s and 2.0 s.
