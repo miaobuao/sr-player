@@ -58,6 +58,26 @@ fn a_real_checkpoint_parses_and_reports_what_is_missing() {
             path.file_name().unwrap().to_string_lossy(),
             layer_count, weight_count
         );
+        // The assumption behind this crate's `Pooling`: that every one of them is a
+        // whole-frame reduction. A layer that declares a kernel would be refused at
+        // run time, so the implementation is safe either way — but "implemented" should
+        // mean it covers what the files actually contain, and that is checkable here.
+        for layer in &graph.layers {
+            if layer.kind == "Pooling" {
+                assert!(
+                    layer.option(1).is_none() && layer.option(2).is_none(),
+                    "{}: a Pooling layer declares a kernel, so whole-frame average \
+                     pooling does not cover this checkpoint",
+                    layer.name
+                );
+                assert_eq!(
+                    layer.option(0),
+                    Some(1),
+                    "{}: not average pooling",
+                    layer.name
+                );
+            }
+        }
         eprintln!("  kinds: {kinds:?}");
         eprintln!("  not implemented here: {missing:?}");
         checked += 1;

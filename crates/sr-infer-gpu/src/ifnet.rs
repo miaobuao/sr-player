@@ -370,7 +370,7 @@ impl Model {
 /// gap in a real checkpoint. A second copy elsewhere goes stale the moment an operator
 /// lands and then reports a gap that no longer exists — which is exactly what the
 /// checkpoint test did on the run that added three of them.
-pub const SUPPORTED_KINDS: [&str; 13] = [
+pub const SUPPORTED_KINDS: [&str; 16] = [
     "Input",
     "Split",
     "Concat",
@@ -384,6 +384,9 @@ pub const SUPPORTED_KINDS: [&str; 13] = [
     "PixelShuffle",
     "UnaryOp",
     "InnerProduct",
+    "Pooling",
+    "Clip",
+    "Sigmoid",
 ];
 
 /// Builds a three-level coarse-to-fine interpolation network.
@@ -972,7 +975,53 @@ impl Model {
                     }
                     blobs.insert(top, frame);
                 }
-                "InnerProduct" => {
+                "Pooling" => {
+                    // A global average, which the file's own shape gives away: flownet
+                    // has 48 InnerProducts and 24 Poolings, and that 2:1 is a
+                    // squeeze-and-excitation block — a mean over the whole frame
+                    // followed by two fully-connected layers. The layers are named
+                    // `ReduceMean_*` and declare `0=1 4=1`: average, stride one, no
+                    // kernel, which is a whole-frame reduction rather than a window.
+                    //
+                    // A windowed pooling is refused by name. Implementing one from a
+                    // guess about which key is the kernel would be worse than saying
+                    // that this evaluator does not do it.
+                    let kernel = layer.option(1).or_else(|| layer.option(2));
+                    if kernel.is_some() {
+                        return Err(ModelError::Shape(format!(
+                            "`{}`: only whole-frame average pooling is implemented, and this \
+                             layer declares a {kernel:?}-wide kernel",
+                            layer.name
+                        )));
+                    }
+                    let input = bottom(0)?;
+                    let pixels = (input.width * input.height).max(1) as f32;
+                    let mut output = Planar::new(1, 1, input.channels);
+                    for channel in 0..input.channels {
+                        let sum: f32 = (0..input.height)
+                            .flat_map(|y| (0..input.width).map(move |x| (x, y)))
+                            .map(|(x, y)| input.at(channel, x, y))
+                            .sum();
+                        output.set(channel, 0, 0, sum / pixels);
+                    }
+                    blobs.insert(top, output);
+                }
+                "Clip" => {
+                    let min = layer.float_option(0).unwrap_or(-1.0);
+                    let max = layer.float_option(1).unwrap_or(1.0);
+                    let mut frame = bottom(0)?.clone();
+                    for value in frame.data.iter_mut() {
+                        *value = value.clamp(min, max);
+                    }
+                    blobs.insert(top, frame);
+                }
+                "Sigmoid" => {
+                    let mut frame = bottom(0)?.clone();
+                    for value in frame.data.iter_mut() {
+                        *value = 1.0 / (1.0 + (-*value).exp());
+                    }
+                    blobs.insert(top, frame);
+                }                "InnerProduct" => {
                     // A real RIFE checkpoint uses this as a 1x1 convolution: 16 outputs
                     // over 64 input channels is 1024 weights, and that is exactly what
                     // the file declares. The check is the evidence, so a genuine
