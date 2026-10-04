@@ -42,13 +42,52 @@ pub struct Layer {
     pub name: String,
     pub bottoms: Vec<String>,
     pub tops: Vec<String>,
-    /// `key=value` options, with the keys the format uses for convolution shape.
+    /// `key=value` options with integer values.
     pub options: HashMap<u32, i32>,
+    /// The same options as floats. Several of them are genuinely floats — a
+    /// `BinaryOp`'s scalar is written `1=2.000000`, which does not parse as an
+    /// integer, so keeping only integers silently drops it and turns a multiply
+    /// into nothing.
+    pub float_options: HashMap<u32, f32>,
 }
 
 impl Layer {
+    /// A layer with integer options only. Most layers are this, and spelling the
+    /// float map out at every construction site invites the kind of omission that
+    /// only shows up as a wrong number much later.
+    ///
+    /// The float map mirrors the integers rather than starting empty, because that
+    /// is what parsing the same options out of a file produces. Two ways of
+    /// building a layer that disagree about the layer they built is how a round
+    /// trip stops being exact, and the round-trip test is the thing that would
+    /// notice — which it did.
+    pub fn new(
+        kind: &str,
+        name: &str,
+        bottoms: Vec<String>,
+        tops: Vec<String>,
+        options: HashMap<u32, i32>,
+    ) -> Self {
+        let float_options = options
+            .iter()
+            .map(|(key, value)| (*key, *value as f32))
+            .collect();
+        Layer {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            bottoms,
+            tops,
+            options,
+            float_options,
+        }
+    }
+
     pub fn option(&self, key: u32) -> Option<i32> {
         self.options.get(&key).copied()
+    }
+
+    pub fn float_option(&self, key: u32) -> Option<f32> {
+        self.float_options.get(&key).copied()
     }
 
     /// `num_output`, the one option a convolution must have.
@@ -157,10 +196,16 @@ pub fn parse_param(text: &str) -> Result<Graph, ModelError> {
             .map(|value| value.to_string())
             .collect();
         let mut options = HashMap::new();
+        let mut float_options = HashMap::new();
         for field in &fields[expected..] {
             if let Some((key, value)) = field.split_once('=') {
-                if let (Ok(key), Ok(value)) = (key.parse::<u32>(), value.parse::<i32>()) {
-                    options.insert(key, value);
+                if let Ok(key) = key.parse::<u32>() {
+                    if let Ok(value) = value.parse::<i32>() {
+                        options.insert(key, value);
+                    }
+                    if let Ok(value) = value.parse::<f32>() {
+                        float_options.insert(key, value);
+                    }
                 }
             }
         }
@@ -170,6 +215,7 @@ pub fn parse_param(text: &str) -> Result<Graph, ModelError> {
             bottoms,
             tops,
             options,
+            float_options,
         };
         weight_count += layer_weight_count(&layer);
         layers.push(layer);
@@ -252,6 +298,56 @@ impl Model {
         Ok(Model { graph, weights })
     }
 
+    /// Writes the graph as an ncnn `.param` file and the weights as `.bin`.
+    ///
+    /// This closes the loop with [`Model::load`]: a generated topology can be
+    /// written out, read back and run, which is what makes the loader trustworthy
+    /// for a checkpoint nobody generated — the two paths meet in the middle and
+    /// have to agree.
+    pub fn write_checkpoint(&self, param_path: &Path) -> Result<(), ModelError> {
+        let mut text = String::from("7767517\n");
+        let blobs: usize = self
+            .graph
+            .layers
+            .iter()
+            .map(|layer| layer.tops.len())
+            .sum();
+        text.push_str(&format!("{} {}\n", self.graph.layers.len(), blobs));
+        for layer in &self.graph.layers {
+            text.push_str(&format!(
+                "{:<16} {:<8} {} {}",
+                layer.kind,
+                layer.name,
+                layer.bottoms.len(),
+                layer.tops.len()
+            ));
+            for bottom in &layer.bottoms {
+                text.push(' ');
+                text.push_str(bottom);
+            }
+            for top in &layer.tops {
+                text.push(' ');
+                text.push_str(top);
+            }
+            let mut keys: Vec<&u32> = layer.options.keys().collect();
+            keys.sort();
+            for key in keys {
+                text.push_str(&format!(" {key}={}", layer.options[key]));
+            }
+            text.push('\n');
+        }
+        std::fs::write(param_path, text)
+            .map_err(|err| ModelError::Io(format!("{}: {err}", param_path.display())))?;
+
+        let mut bytes = Vec::with_capacity(self.weights.len() * 4);
+        for value in &self.weights {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let bin_path = param_path.with_extension("bin");
+        std::fs::write(&bin_path, bytes)
+            .map_err(|err| ModelError::Io(format!("{}: {err}", bin_path.display())))
+    }
+
     /// True when every layer is one this module can execute.
     pub fn is_runnable(&self) -> bool {
         self.graph
@@ -298,71 +394,65 @@ pub fn pyramid(width: usize, height: usize, channels: usize, features: usize) ->
         options.insert(1u32, 3);
         options.insert(7u32, in_ch as i32);
         weights.extend(std::iter::repeat(0.0).take(out_ch * in_ch * 9 + out_ch));
-        Layer {
-            kind: "Convolution".into(),
-            name: name.into(),
-            bottoms: vec![from.into()],
-            tops: vec![to.into()],
+        Layer::new(
+            "Convolution",
+            name,
+            vec![from.into()],
+            vec![to.into()],
             options,
-        }
+        )
     };
     let prelu = |name: &str, from: &str, to: &str, channels: usize, weights: &mut Vec<f32>| {
         let mut options = HashMap::new();
         options.insert(0u32, channels as i32);
         weights.extend(std::iter::repeat(0.0).take(channels));
-        Layer {
-            kind: "PReLU".into(),
-            name: name.into(),
-            bottoms: vec![from.into()],
-            tops: vec![to.into()],
-            options,
-        }
+        Layer::new("PReLU", name, vec![from.into()], vec![to.into()], options)
     };
     let interp = |name: &str, from: &str, to: &str, w: usize, h: usize| {
         let mut options = HashMap::new();
         options.insert(0u32, w as i32);
         options.insert(1u32, h as i32);
+        Layer::new("Interp", name, vec![from.into()], vec![to.into()], options)
+    };
+    let scalar_mul = |name: &str, from: &str, to: &str, factor: f32| {
+        let mut options = HashMap::new();
+        options.insert(0u32, 2); // BinaryOp op_type 2 = multiply
+        options.insert(1u32, factor as i32);
+        let mut float_options = HashMap::new();
+        float_options.insert(0u32, 2.0);
+        float_options.insert(1u32, factor);
         Layer {
-            kind: "Interp".into(),
+            kind: "BinaryOp".into(),
             name: name.into(),
             bottoms: vec![from.into()],
             tops: vec![to.into()],
             options,
+            float_options,
         }
     };
-    let concat = |name: &str, first: &str, second: &str, to: &str| Layer {
-        kind: "Concat".into(),
-        name: name.into(),
-        bottoms: vec![first.into(), second.into()],
-        tops: vec![to.into()],
-        options: HashMap::new(),
+    let concat = |name: &str, first: &str, second: &str, to: &str| {
+        Layer::new(
+            "Concat",
+            name,
+            vec![first.into(), second.into()],
+            vec![to.into()],
+            HashMap::new(),
+        )
     };
     let warp = |name: &str, frame: &str, flow: &str, to: &str| {
         let mut options = HashMap::new();
         options.insert(0u32, 2);
-        Layer {
-            kind: "Warp".into(),
-            name: name.into(),
-            bottoms: vec![frame.into(), flow.into()],
-            tops: vec![to.into()],
+        Layer::new(
+            "Warp",
+            name,
+            vec![frame.into(), flow.into()],
+            vec![to.into()],
             options,
-        }
+        )
     };
 
-    push(Layer {
-        kind: "Input".into(),
-        name: "input0".into(),
-        bottoms: Vec::new(),
-        tops: vec!["a".into()],
-        options: HashMap::new(),
-    });
-    push(Layer {
-        kind: "Input".into(),
-        name: "input1".into(),
-        bottoms: Vec::new(),
-        tops: vec!["b".into()],
-        options: HashMap::new(),
-    });
+    push(Layer::new("Input", "input0", Vec::new(), vec!["a".into()], HashMap::new()));
+    push(Layer::new("Input", "input1", Vec::new(), vec!["b".into()], HashMap::new()));
 
     // ---- coarsest level: a quarter resolution -----------------------------
     let (w4, h4) = ((width / 4).max(2), (height / 4).max(2));
@@ -378,23 +468,28 @@ pub fn pyramid(width: usize, height: usize, channels: usize, features: usize) ->
     push(interp("down_a2", "a", "a2", w2, h2));
     push(interp("down_b2", "b", "b2", w2, h2));
     push(interp("up_flow4", "flow4", "flow4_up", w2, h2));
+    // A flow measured at a quarter resolution describes twice the displacement
+    // when it is read at half resolution, so it is scaled before use — this is
+    // the step that makes coarse-to-fine work rather than merely exist.
+    push(scalar_mul("scale4", "flow4_up", "flow4_x2", 2.0));
     push(concat("cat2ab", "a2", "b2", "pair2"));
-    push(concat("cat2", "pair2", "flow4_up", "enc2_in"));
+    push(concat("cat2", "pair2", "flow4_x2", "enc2_in"));
     push(conv("enc2", "enc2_in", "enc2", features, channels * 2 + 2, &mut weights));
     push(prelu("enc2r", "enc2", "enc2r", features, &mut weights));
     push(conv("delta2", "enc2r", "delta2", 2, features, &mut weights));
-    push(Layer {
-        kind: "Add".into(),
-        name: "flow2".into(),
-        bottoms: vec!["flow4_up".into(), "delta2".into()],
-        tops: vec!["flow2".into()],
-        options: HashMap::new(),
-    });
+    push(Layer::new(
+        "Add",
+        "flow2",
+        vec!["flow4_x2".into(), "delta2".into()],
+        vec!["flow2".into()],
+        HashMap::new(),
+    ));
 
     // ---- finest level: full resolution, where the answer is used ----------
     push(interp("up_flow2", "flow2", "flow2_up", width, height));
-    push(warp("warpa", "a", "flow2_up", "warpa"));
-    push(warp("warpb", "b", "flow2_up", "warpb"));
+    push(scalar_mul("scale2", "flow2_up", "flow2_x2", 2.0));
+    push(warp("warpa", "a", "flow2_x2", "warpa"));
+    push(warp("warpb", "b", "flow2_x2", "warpb"));
     push(concat("cat1", "warpa", "warpb", "joined"));
     let fusion_at = weights.len();
     push(conv("fusion", "joined", "out", channels, channels * 2, &mut weights));
@@ -557,6 +652,53 @@ impl Model {
                             "`{}` adds {} channels to {}",
                             layer.name, other.channels, frame.channels
                         )));
+                    }
+                    blobs.insert(top, frame);
+                }
+                "BinaryOp" => {
+                    // ncnn's op_type: 0 add, 1 sub, 2 mul, 3 div. With one bottom
+                    // the second operand is the scalar `1=b`, which is how a real
+                    // checkpoint writes the "upsampled flow times two" step.
+                    let op = layer.option(0).unwrap_or(0);
+                    let mut frame = bottom(0)?.clone();
+                    let scalar = layer.float_option(1);
+                    let other = if layer.bottoms.len() >= 2 {
+                        Some(bottom(1)?.clone())
+                    } else {
+                        None
+                    };
+                    if other.is_none() && scalar.is_none() {
+                        return Err(ModelError::Shape(format!(
+                            "`{}` has one bottom and no scalar; there is nothing to apply",
+                            layer.name
+                        )));
+                    }
+                    for index in 0..frame.data.len() {
+                        let right = match &other {
+                            Some(frame_b) => frame_b.data[index],
+                            None => scalar.unwrap_or(0.0),
+                        };
+                        let left = frame.data[index];
+                        frame.data[index] = match op {
+                            0 => left + right,
+                            1 => left - right,
+                            2 => left * right,
+                            3 => {
+                                if right == 0.0 {
+                                    return Err(ModelError::Shape(format!(
+                                        "`{}` divides by zero",
+                                        layer.name
+                                    )));
+                                }
+                                left / right
+                            }
+                            other_op => {
+                                return Err(ModelError::Shape(format!(
+                                    "`{}`: BinaryOp type {other_op} is not implemented",
+                                    layer.name
+                                )))
+                            }
+                        };
                     }
                     blobs.insert(top, frame);
                 }
@@ -1141,6 +1283,89 @@ mod tests {
             worst < 1e-5,
             "a pyramid with no flow must be a blend; worst difference {worst}"
         );
+    }
+
+    /// A generated topology survives a round trip through the checkpoint format.
+    ///
+    /// This is what makes the loader trustworthy for a file nobody generated. The
+    /// two paths have to meet in the middle: the graph is written as ncnn text and
+    /// raw weights, read back by the same code that would read a downloaded
+    /// checkpoint, and both models are then run on the same input and compared.
+    /// A float option that failed to survive the text (`1=2.000000` is not an
+    /// integer) would show up here as a missing scale rather than as a subtly
+    /// different picture.
+    #[test]
+    fn a_pyramid_written_to_a_checkpoint_runs_identically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let param_path = dir.path().join("pyramid.param");
+        let original = pyramid(24, 16, 3, 4);
+        original
+            .write_checkpoint(&param_path)
+            .expect("write the checkpoint");
+
+        let loaded = Model::load(&param_path).expect("load it back");
+        assert_eq!(
+            loaded.graph.layers, original.graph.layers,
+            "every layer must survive the text"
+        );
+        assert_eq!(
+            loaded.graph.weight_count, original.graph.weight_count,
+            "the declared weight count must survive"
+        );
+        assert_eq!(loaded.weights.len(), original.weights.len());
+
+        // The scalar multiply is the option most likely to be dropped: it is the
+        // only float in the graph.
+        let scalar = loaded
+            .graph
+            .layers
+            .iter()
+            .find(|layer| layer.kind == "BinaryOp")
+            .expect("the scale layer must survive");
+        assert_eq!(
+            scalar.float_option(1),
+            Some(2.0),
+            "the flow scale must be written and read as a float, not lost to an \
+             integer parse"
+        );
+
+        let a = gradient(24, 16, 3, 0.2);
+        let b = gradient(24, 16, 3, 0.7);
+        let from_generated = original.forward(&a, &b).expect("forward");
+        let from_file = loaded.forward(&a, &b).expect("forward from the file");
+        assert_eq!(from_generated.data.len(), from_file.data.len());
+        let worst = from_generated
+            .data
+            .iter()
+            .zip(from_file.data.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst == 0.0,
+            "a round trip through the checkpoint format must be exact; difference {worst}"
+        );
+    }
+
+    /// The scale is applied, and in the direction that makes coarse-to-fine work:
+    /// a flow measured at a quarter resolution describes twice the displacement
+    /// when it is read at half resolution.
+    #[test]
+    fn a_scalar_multiply_scales_a_flow_field() {
+        let graph = parse_param(&param(
+            "Input            a        0 1 a\n\
+             BinaryOp         scale    1 1 a out 0=2 1=2.000000\n",
+        ))
+        .expect("parse");
+        let model = Model {
+            graph,
+            weights: Vec::new(),
+        };
+        let mut input = Planar::new(2, 2, 2);
+        input.set(0, 0, 0, 1.5);
+        input.set(1, 1, 1, -0.75);
+        let output = model.forward(&input, &input).expect("forward");
+        assert!((output.at(0, 0, 0) - 3.0).abs() < 1e-6);
+        assert!((output.at(1, 1, 1) + 1.5).abs() < 1e-6);
     }
 
     fn gradient(width: usize, height: usize, channels: usize, base: f32) -> Planar {

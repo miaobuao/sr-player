@@ -195,6 +195,35 @@ fn interp(@builtin(global_invocation_id) id: vec3<u32>) {
     let bottom = src_at(ix0, iy1, channel) * (1.0 - fx) + src_at(ix1, iy1, channel) * fx;
     output[id.x] = top * (1.0 - fy) + bottom * fy;
 }
+// A scalar multiply: `output = input * factor`. `divisor` carries the factor and
+// `pad0` the operation code, which is what ncnn's `BinaryOp` reduces to when it
+// has one bottom and a scalar. This is the "upsampled flow times two" step, and
+// leaving it out of a coarse-to-fine pyramid halves every refined displacement.
+@compute @workgroup_size(64, 1, 1)
+fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
+    let count = params.width * params.height * params.in_ch;
+    if (id.x >= count) {
+        return;
+    }
+    let left = input[id.x];
+    let right = params.divisor;
+    let op = u32(params.src_width);
+    if (op == 2u) {
+        output[id.x] = left * right;
+    } else if (op == 0u) {
+        output[id.x] = left + right;
+    } else if (op == 1u) {
+        output[id.x] = left - right;
+    } else if (op == 3u) {
+        if (right == 0.0) {
+            output[id.x] = 0.0;
+        } else {
+            output[id.x] = left / right;
+        }
+    } else {
+        output[id.x] = left;
+    }
+}
 "#;
 
 /// One dispatch's uniform block. The layout must match `Params` in the shader.
@@ -246,6 +275,7 @@ pub struct GpuOps {
     add: wgpu::ComputePipeline,
     concat: wgpu::ComputePipeline,
     interp: wgpu::ComputePipeline,
+    scale: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -298,6 +328,7 @@ impl GpuOps {
         let add = pipeline("add");
         let concat = pipeline("concat");
         let interp = pipeline("interp");
+        let scale = pipeline("scale");
         Ok(GpuOps {
             device,
             queue,
@@ -307,6 +338,7 @@ impl GpuOps {
             add,
             concat,
             interp,
+            scale,
         })
     }
 
@@ -587,6 +619,38 @@ impl GpuOps {
                     blobs.insert(top.clone(), output);
                     shapes.insert(top, (width, height, channels));
                 }
+                "BinaryOp" => {
+                    // One bottom and a scalar, which is the only form the pyramid
+                    // uses: the flow scale. A two-bottom element-wise operation
+                    // would need the pair dispatch and is refused by name.
+                    if layer.bottoms.len() != 1 {
+                        return Err(ModelError::Shape(format!(
+                            "`{}`: only a one-bottom BinaryOp is implemented on the device",
+                            layer.name
+                        )));
+                    }
+                    let (input, (width, height, channels)) = bottom(0)?;
+                    let input = input.clone();
+                    let factor = layer.float_option(1).unwrap_or(1.0);
+                    let op = layer.option(0).unwrap_or(0) as f32;
+                    let output = self.empty(width * height * channels);
+                    // `scale` reads the factor from `divisor` and the op code from
+                    // `src_width`, both free for a kernel that never resizes.
+                    let mut params = Params::new(width, height, channels, channels, factor);
+                    params.src_width = op;
+                    let params = self.uniform(params);
+                    self.dispatch_single(
+                        &mut encoder,
+                        &self.scale,
+                        "scale",
+                        &input,
+                        &output,
+                        &params,
+                        width * height * channels,
+                    );
+                    blobs.insert(top.clone(), output);
+                    shapes.insert(top, (width, height, channels));
+                }
                 "Interp" => {
                     let (input, (src_width, src_height, channels)) = bottom(0)?;
                     let input = input.clone();
@@ -825,7 +889,7 @@ pub fn unsupported_on_device(model: &Model) -> Vec<String> {
         .filter(|layer| {
             !matches!(
                 layer.kind.as_str(),
-                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp" | "Interp"
+                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp" | "Interp" | "BinaryOp"
             )
         })
         .map(|layer| format!("{} ({})", layer.kind, layer.name))
@@ -1107,15 +1171,41 @@ mod tests {
     fn a_layer_the_device_cannot_run_is_reported_by_name() {
         let graph = model(
             "Input            a        0 1 a\n\
-             BinaryOp         mul      1 1 a out 0=0\n",
+             BatchNorm        bn       1 1 a out 0=3\n",
             Vec::new(),
         );
         assert_eq!(
             unsupported_on_device(&graph),
-            vec!["BinaryOp (mul)".to_string()]
+            vec!["BatchNorm (bn)".to_string()]
         );
-        // And the pyramid must not be on that list, or the multi-scale device test
-        // would be measuring nothing.
+
+        // A supported kind with an unsupported arity is a different case: it is not
+        // in the static list, and the runner has to refuse it by name when it gets
+        // there rather than treat the second operand as absent.
+        let two_bottom = model(
+            "Input            a        0 1 a\n\
+             Input            b        0 1 b\n\
+             BinaryOp         op       2 1 a b out 0=0\n",
+            Vec::new(),
+        );
+        assert!(unsupported_on_device(&two_bottom).is_empty());
+        let error = ops_or_skip()
+            .map(|ops| {
+                ops.forward(
+                    &two_bottom,
+                    &gradient(4, 4, 1, 0.1),
+                    &gradient(4, 4, 1, 0.2),
+                )
+            })
+            .unwrap_or(Ok(crate::ifnet::Planar::new(1, 1, 1)))
+            .expect_err("a two-bottom BinaryOp is not implemented on the device");
+        assert!(
+            error.to_string().contains("one-bottom BinaryOp"),
+            "the error must say which form is supported: {error}"
+        );
+
+        // And the pyramid must not be on the static list, or the multi-scale device
+        // test would be measuring nothing.
         let pyramid = crate::ifnet::pyramid(16, 16, 3, 4);
         assert!(
             unsupported_on_device(&pyramid).is_empty(),
