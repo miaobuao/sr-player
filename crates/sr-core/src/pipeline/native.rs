@@ -238,7 +238,12 @@ impl<'a> NativeExecutor<'a> {
         }
 
         // ---- session ------------------------------------------------------
-        let request = session_request(ctx, inference.temporal_window);
+        // The device index comes from the backend's own enumeration: the engine's
+        // Vulkan probe and the backend's device list are different lists, and on a
+        // machine with an integrated and a discrete GPU they need not agree on
+        // which is device 0.
+        let device_index = engine.preferred_device_index().unwrap_or(0);
+        let request = session_request(ctx, inference.temporal_window, device_index);
         let mut session = engine.open_session(&request).map_err(|err| Error::Stage {
             stage: Stage::Restore.id().into(),
             detail: format!(
@@ -1221,7 +1226,7 @@ fn restore_strength(ctx: &NativeContext<'_>) -> f32 {
         .unwrap_or(1.0)
 }
 
-fn session_request(ctx: &NativeContext<'_>, window: u32) -> SessionRequest {
+fn session_request(ctx: &NativeContext<'_>, window: u32, device_index: u32) -> SessionRequest {
     let mut config = serde_json::json!({
         "working_set": {
             "batch": ctx.working.batch,
@@ -1256,7 +1261,7 @@ fn session_request(ctx: &NativeContext<'_>, window: u32) -> SessionRequest {
         }
     }
     SessionRequest {
-        device_index: 0,
+        device_index,
         model_path: None,
         model_name: None,
         config_json: Some(config.to_string()),

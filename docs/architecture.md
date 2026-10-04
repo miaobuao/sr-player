@@ -114,6 +114,32 @@ this very build was caught (`loudnorm`'s JSON report claimed `+29.48 LUFS` for a
 file `ebur128` and `volumedetect` both read as `-21.9 LUFS`); the final gain is
 now computed from `ebur128`, one source of truth.
 
+## GPU discovery
+
+`gpu` probes **Vulkan first**. The loader is opened at runtime with `libloading`
+(no SDK, no import library), the instance is created, and every physical device is
+read for `vendorID`, `deviceID`, `deviceType`, driver strings and — through
+`VK_EXT_memory_budget` — the per-heap budget and usage the driver will hand out.
+Vendor tools (`nvidia-smi`, `rocm-smi`) are merged in afterwards to sharpen a row
+with the one thing Vulkan cannot say: what *other* processes are holding.
+
+The order used to be the other way round, which meant Intel was never seen, an AMD
+card on Windows (where `rocm-smi` does not exist) was never seen, and the number
+the planner actually needs was missing on two of three vendors.
+
+Two details decide whether an unattended run OOMs:
+
+* `heapUsage` is *this process's* usage, not the machine's. Taking it at face value
+  reports 14.9 GiB free on a card whose desktop is already holding 3.4 GiB. The
+  planner takes the **most pessimistic** of `budget - process_usage` and
+  `total - system_usage`.
+* An integrated GPU's "device-local" heap is system RAM. It is reported as shared,
+  excluded from `free_mib`, and never chosen as the device a model runs on.
+
+The backend's own device list wins over the probe when a backend is installed: it
+is the thing that will actually allocate, and its numbering need not agree with
+the probe's about which device is number zero.
+
 ## The inference ABI
 
 `include/sr_infer.h` defines ABI **v2**: device enumeration (`sr_infer_devices`),
@@ -132,11 +158,33 @@ so a plugin could be *loaded* with no way to *run a model*.
 
 A plugin can be backed by Vulkan compute, DirectML, OpenVINO, MIGraphX, TensorRT,
 ncnn or a CPU kernel; the engine only asks what it can do and hands it frames.
-`crates/sr-infer-plugin-example` is a real shared library implementing that ABI
-with **no dependency on `sr-core`** (it keeps its own copies of the structs, so a
-drift between the header and the engine's bindings fails a test instead of
-misreading memory), and `sr-core`'s tests load it through
-`dlopen`/`LoadLibrary` and call it.
+`crates/sr-infer-plugin-example` is a reference shared library implementing that
+ABI with **no dependency on `sr-core`** (it keeps its own copies of the structs, so
+a drift between the header and the engine's bindings fails a test instead of
+misreading memory).
+
+`crates/sr-infer-gpu` is the same contract implemented on Vulkan with WGSL kernels
+compiled by naga at runtime — no shader compiler, no SDK, and Vulkan only, because
+a backend that calls itself Vulkan and quietly runs on DX12 would be the kind of
+claim this project exists to stop making. It is a **test dependency** of `sr-core`:
+the shipped engine has no GPU API dependency at all, and the engine's own test
+suite loads the backend as a plugin, exactly as a user would.
+
+Its quality is measured, not asserted:
+
+| check | result |
+|---|---|
+| WGSL kernels vs an independent Rust implementation | bit-identical on every pixel |
+| NVIDIA vs AMD driver, same input | bit-identical |
+| rigid translation vs the hidden middle frame | interior PSNR infinite (exact); frame duplication: 13.8 dB |
+| ABI contract: every output slot written | checked, after a version filled only the synthesised slots |
+
+That last row is the instructive one. The backend's interpolation was correct, the
+frame count was correct and the project's own checks passed — while every
+pass-through frame in the file was blank, because the plugin wrote only the slots
+it synthesised. Only looking at the pixels of the committed chunk caught it, which
+is why `tests/gpu_execution.rs` decodes the intermediate and measures it instead of
+trusting the log.
 
 Engines are ranked and selected: plugin (model) > `minterpolate`
 (motion-compensated, FFmpeg) > deterministic resample. The baseline always

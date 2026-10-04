@@ -12,7 +12,7 @@ use crate::infer::{EngineKind, EngineRegistry, InferenceEngine, InferenceTask};
 use crate::media::classify::{TemporalMode, TemporalReport};
 use crate::media::manifest::{MediaManifest, PreservationInventory};
 use crate::media::scene::SceneReport;
-use crate::pipeline::policy::{plan_vram, VramBudget, WorkingSet};
+use crate::pipeline::policy::{plan_vram_with, VramBudget, WorkingSet};
 use crate::pipeline::profile::{
     InterpolationMethod, LoudnessTarget, OutputSettings, RestorationProfile,
 };
@@ -1030,10 +1030,11 @@ pub fn build_plan(
 
     // --- budget -------------------------------------------------------------
     let gpus = crate::gpu::probe();
-    let vram = plan_vram(
+    let vram = plan_vram_with(
         profile.gpu.max_ai_vram_mib,
         profile.gpu.reserve_mib,
         &gpus,
+        engines.backend_free_mib(),
     );
     for note in &vram.notes {
         notes.push(note.clone());

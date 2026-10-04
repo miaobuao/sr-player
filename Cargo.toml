@@ -5,6 +5,7 @@ members = [
     "crates/sr-cli",
     "crates/sr-gui",
     "crates/sr-infer-plugin-example",
+    "crates/sr-infer-gpu",
 ]
 
 [workspace.package]

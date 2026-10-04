@@ -33,7 +33,8 @@ starting over, and every stage degrades instead of failing:
 | `crates/sr-core` | the media engine. Probing, rational timeline, cadence classification, shot detection, BS.1770 + dialogue analysis, native DSP, pipeline scheduler, SQLite state, inference ABI |
 | `crates/sr-gui` | GPUI front end. File picker, run controls, stage ladder, progress, logs, media/plan/engine panels. Contains no media logic |
 | `crates/sr-cli` | headless driver: `probe`, `analyze`, `convert`, `jobs`, `log`, `engines`, `profiles` |
-| `crates/sr-infer-plugin-example` | a working shared library implementing the `sr_infer` C ABI, loaded by `sr-core`'s tests |
+| `crates/sr-infer-plugin-example` | a reference shared library implementing the `sr_infer` C ABI, used as a test instrument |
+| `crates/sr-infer-gpu` | a Vulkan backend implementing that ABI: block-matching motion-compensated interpolation in WGSL |
 | `include/sr_infer.h` | the plugin ABI as C |
 
 Dependency direction is one-way: `sr-cli`/`sr-gui` → `sr-core` → FFmpeg. The
@@ -46,6 +47,34 @@ engine never depends on a UI, and the UI never touches media.
 * Rust 1.85+ (developed on 1.98, stable-msvc).
 * **No Python. No PyTorch. No CUDA. No vendor SDK.** A model backend is an
   optional accelerator behind a C ABI, never a correctness dependency.
+* **Vulkan is optional too.** It is used for two things: probing the machine's
+  GPU (through the loader, at runtime, with no SDK) and running the GPU backend,
+  which is a plugin you can simply not install. A machine without Vulkan runs the
+  deterministic path and says so.
+
+## The GPU backend
+
+`crates/sr-infer-gpu` is a real backend, not a stub: WGSL compute kernels, driven
+through the ABI, doing **block-matching motion-compensated interpolation**. For
+every 8x8 block it searches the displacement that best matches the two frames,
+warps both frames along half of it, and blends — preferring the nearer sample
+where the two disagree strongly, because averaging an occlusion is what makes a
+ghost.
+
+```powershell
+cargo build --release -p sr-infer-gpu
+$env:SR_INFER_PLUGIN = "target\release\sr_infer_gpu.dll"
+cargo run -p sr-cli -- convert "D:\films\movie.mkv" -o out.mkv
+```
+
+What it is *not*: a learned model. There are no weights, so it cannot invent
+detail, and it does not restore — `sr_infer_query` advertises interpolation only,
+which is why `--profile safe-16gb` will not claim a restoration that did not
+happen. Its quality is measured rather than asserted: a rigid translation is
+reconstructed **bit-exactly** (interior PSNR infinite, versus 13.8 dB for frame
+duplication), the shader agrees with an independent Rust implementation
+bit-for-bit, and on a machine with two GPUs both drivers produce identical
+output.
 
 ## Quick start
 
@@ -89,7 +118,7 @@ graph with a nicer name:
 ## Verification
 
 ```powershell
-cargo test --workspace                     # 200 tests: 193 unit + 3 end-to-end + 1 model-execution + 3 plugin ABI
+cargo test --workspace                     # 217 tests: 207 unit + 3 end-to-end + 1 model-execution + 1 gpu-execution + 5 gpu kernels
 powershell -File testdata\make_fixture.ps1 # 8 s DVD-shaped fixture (the long-form check)
 cargo run -p sr-cli -- analyze testdata\sample-dvd.mkv
 cargo run -p sr-cli -- convert testdata\sample-dvd.mkv -o testdata\out.mkv
@@ -123,15 +152,20 @@ both original tracks**, the subtitle, the attachment and both chapters.
 
 These are stated rather than hidden:
 
-* **No quality model ships.** The plugin ABI (v2) can carry RIFE-class
+* **No learned model ships.** The plugin ABI (v2) can carry RIFE-class
   interpolation and SeedVR2-class restoration — sessions, devices, multi-frame
   windows, dtypes, tiling, memory budgets, out-of-memory feedback — and the
-  executor that drives it is real. What ships in-tree is a *reference* backend
-  whose interpolation is a detail-preserving blend and whose restoration is an
-  unsharp mask: enough to prove the path end to end and to test the degrade
-  ladder, not enough to restore a film. Without a plugin the engine is
-  deterministic: it resamples, corrects cadence, remasters audio and encodes, and
-  invents nothing.
+  executor that drives it is real, as is the Vulkan backend. What the GPU backend
+  implements is *search-based* motion compensation, not a network: it finds flow
+  instead of learning it, so it cannot invent detail and it does not restore.
+  The in-tree reference plugin is a test instrument (blend + unsharp mask) whose
+  job is to keep the ABI honest and the degrade ladder testable. Without a plugin
+  the engine is deterministic: it resamples, corrects cadence, remasters audio and
+  encodes, and invents nothing.
+* **The model path transfers frames through host memory.** The ABI has a
+  device-handle path (`SR_MEM_DEVICE`) for zero-copy, but the executor hands over
+  host buffers today, so each call pays two uploads and a download. Fine for a
+  preprocess-and-watch run; not how you would stream a two-hour feature at speed.
 * **Lanczos still does the final resize.** A model that restores at source
   resolution is not a super-resolution model; the deterministic upscale to the
   target raster is labelled as such in the plan.

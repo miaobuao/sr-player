@@ -71,8 +71,37 @@ impl VramBudget {
 
 /// `min(hard ceiling, free - reserve)`.
 pub fn plan_vram(hard_ceiling_mib: u64, reserve_mib: u64, gpus: &[GpuInfo]) -> VramBudget {
-    let free = gpu::free_mib(gpus);
+    plan_vram_with(hard_ceiling_mib, reserve_mib, gpus, None)
+}
+
+/// The same decision, but preferring the number the *model backend* reports.
+///
+/// The engine's Vulkan probe and the backend's device list are different views of
+/// the same card, and the backend is the one that will actually allocate. When it
+/// can see a budget, that budget is the truth; the probe is a fallback for the
+/// case where no model is installed at all.
+pub fn plan_vram_with(
+    hard_ceiling_mib: u64,
+    reserve_mib: u64,
+    gpus: &[GpuInfo],
+    backend_free_mib: Option<u64>,
+) -> VramBudget {
+    let probe_free = gpu::free_mib(gpus);
+    // The backend's number wins when there is one, even if it is *larger*: it is
+    // the process that has to make the allocation succeed, and it knows about the
+    // memory it is already holding.
+    let free = backend_free_mib.or(probe_free);
     let mut notes = Vec::new();
+    if let (Some(backend), Some(probe)) = (backend_free_mib, probe_free) {
+        if backend != probe {
+            notes.push(format!(
+                "the model backend reports {:.1} GiB available while the device probe sees {:.1} \
+                 GiB: budgeting against the backend, because it is the one that allocates",
+                backend as f64 / 1024.0,
+                probe as f64 / 1024.0
+            ));
+        }
+    }
     let mut budget = hard_ceiling_mib;
     if let Some(free) = free {
         let available = free.saturating_sub(reserve_mib);
@@ -220,7 +249,7 @@ impl WorkingSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::GpuVendor;
+    use crate::gpu::{GpuDeviceType, GpuVendor};
     use crate::pipeline::profile::RestorationProfile;
 
     fn gpu(total: u64, used: u64) -> GpuInfo {
@@ -229,7 +258,9 @@ mod tests {
             name: "RTX 5070 Ti".into(),
             total_mib: Some(total),
             used_mib: Some(used),
+            device_type: GpuDeviceType::Discrete,
             source: "nvidia-smi".into(),
+            ..GpuInfo::default()
         }
     }
 

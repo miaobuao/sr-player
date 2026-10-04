@@ -212,6 +212,25 @@ pub trait InferenceEngine: Send + Sync {
             self.id()
         )))
     }
+
+    /// The device index a session should be opened on, in *this engine's* own
+    /// numbering.
+    ///
+    /// The engine's Vulkan probe and the backend's device list are two different
+    /// enumerations, and on a machine with an integrated and a discrete GPU they
+    /// need not agree on which is device 0. Asking the backend is the only way to
+    /// be sure a model does not land on the iGPU because of a list order.
+    fn preferred_device_index(&self) -> Option<u32> {
+        None
+    }
+
+    /// Free memory the backend can see on its best device.
+    ///
+    /// Preferred over the engine's own probe when it exists: the backend is the
+    /// thing that will actually allocate.
+    fn backend_free_mib(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Every engine this machine can offer, probed once at startup.
@@ -279,6 +298,12 @@ impl EngineRegistry {
             .iter()
             .find(|e| e.kind() == EngineKind::Plugin)
             .cloned()
+    }
+
+    /// Free memory the model backend can see, when one is installed.
+    pub fn backend_free_mib(&self) -> Option<u64> {
+        self.model_engine()
+            .and_then(|engine| engine.backend_free_mib())
     }
 
     pub fn has_plugin(&self) -> bool {

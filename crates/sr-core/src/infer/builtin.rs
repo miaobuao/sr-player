@@ -252,6 +252,33 @@ impl InferenceEngine for PluginEngine {
     fn open_session(&self, request: &SessionRequest) -> Result<Box<dyn EngineSession>> {
         self.open_session_with(request)
     }
+
+    fn preferred_device_index(&self) -> Option<u32> {
+        // Ranked by what the device *is* before how much memory it reports: a
+        // backend is not obliged to know its own free memory, and on a machine
+        // with an integrated and a discrete GPU "the one with the highest number"
+        // would otherwise pick whichever came last in a list of zeroes.
+        self.devices
+            .iter()
+            .max_by_key(|device| {
+                let rank = match device.device_type {
+                    super::abi::SR_DEVICE_DISCRETE => 3u8,
+                    super::abi::SR_DEVICE_INTEGRATED => 2,
+                    super::abi::SR_DEVICE_VIRTUAL => 1,
+                    _ => 0,
+                };
+                (rank, device.free_bytes().unwrap_or(0))
+            })
+            .map(|device| device.index)
+    }
+
+    fn backend_free_mib(&self) -> Option<u64> {
+        self.devices
+            .iter()
+            .filter_map(|device| device.free_bytes())
+            .max()
+            .map(|bytes| bytes / (1024 * 1024))
+    }
 }
 
 /// A live plugin session, adapted to the engine's session trait.
