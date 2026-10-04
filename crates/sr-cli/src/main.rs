@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -329,7 +329,7 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             let bus = EventBus::new();
             attach_printer(&bus, cli.verbose);
 
-            let job_id = new_job_id("cli");
+            let job_id = new_job_id(input, &output);
             let scratch = output
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -405,12 +405,80 @@ fn default_output_path(input: &Path) -> PathBuf {
     parent.join(format!("{stem}.restored.mkv"))
 }
 
-fn new_job_id(prefix: &str) -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{prefix}-{seconds}")
+/// A job id derived from what the job *is*, not from when it started.
+///
+/// It used to be `cli-<unix seconds>`, which had two consequences and both were
+/// wrong:
+///
+/// * **resume never happened from the command line.** The chunks table is keyed by
+///   job id, so a second run of the same file looked for a job that had never
+///   existed and redid everything. The resume machinery was unreachable from the
+///   only entry point an unattended user has;
+/// * **two files started in the same second shared a job id.** A batch loop over a
+///   directory does exactly that, and the second run would find the first run's
+///   committed chunks — same id, same scratch directory — and happily reuse
+///   artifacts built from a different film. Nothing validated that a chunk row
+///   belonged to the input being processed.
+///
+/// Hashing the input and output paths fixes both: the same conversion resumes, and
+/// two different conversions cannot collide. FNV-1a rather than `DefaultHasher`,
+/// because a job id has to mean the same thing in a later release.
+fn new_job_id(input: &Path, output: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(input.to_string_lossy().as_bytes());
+    feed(&[0]);
+    feed(output.to_string_lossy().as_bytes());
+
+    // The stem as well, so `sr-cli jobs` and the logs show which film a row belongs
+    // to without a lookup.
+    let stem: String = input
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    if stem.is_empty() {
+        format!("cli-{hash:016x}")
+    } else {
+        format!("cli-{stem}-{hash:016x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The id has to be a function of the job, not of the clock: that is what makes
+    /// a second attempt resume instead of starting over.
+    #[test]
+    fn a_job_id_is_the_same_for_the_same_conversion() {
+        let one = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
+        let two = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
+        assert_eq!(one, two, "the same conversion must resume, not restart");
+        assert!(one.starts_with("cli-a-"), "the id should name the film: {one}");
+    }
+
+    /// And it has to differ for different work, including two files in the same
+    /// second — which is what a batch loop does, and what the old
+    /// `cli-<seconds>` scheme could not tell apart.
+    #[test]
+    fn different_conversions_get_different_ids() {
+        let first = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
+        let second = new_job_id(Path::new("E:/films/b.mkv"), Path::new("E:/out/b.mkv"));
+        assert_ne!(first, second);
+        // The same input to a different output is different work as well: the chunks
+        // are the same but the film being built is not.
+        let third = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a-1080.mkv"));
+        assert_ne!(first, third);
+    }
 }
 
 /// Prints engine events to the terminal: logs always, progress on one line.
