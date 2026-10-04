@@ -246,6 +246,13 @@ fn layer_weight_count(layer: &Layer) -> usize {
             out * input_channels.max(1) * kernel * kernel + out
         }
         "PReLU" => layer.num_output().unwrap_or(0),
+        // `num_output` rows of declared weights each, then the bias the file implies
+        // with `1=bias_term` (which defaults to one).
+        "InnerProduct" => {
+            let out = layer.num_output().unwrap_or(0);
+            let declared = layer.option(2).unwrap_or(0).max(0) as usize;
+            out * declared + if layer.option(1).unwrap_or(1) == 0 { 0 } else { out }
+        }
         "BatchNorm" => layer.num_output().unwrap_or(0) * 4,
         _ => 0,
     }
@@ -353,9 +360,31 @@ impl Model {
         self.graph
             .layers
             .iter()
-            .all(|layer| matches!(layer.kind.as_str(), "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp" | "DepthToSpace"))
+            .all(|layer| SUPPORTED_KINDS.contains(&layer.kind.as_str()))
     }
 }
+
+/// The layer kinds this module can execute.
+///
+/// One list, used by `is_runnable`, by `unsupported`, and by the test that reports the
+/// gap in a real checkpoint. A second copy elsewhere goes stale the moment an operator
+/// lands and then reports a gap that no longer exists — which is exactly what the
+/// checkpoint test did on the run that added three of them.
+pub const SUPPORTED_KINDS: [&str; 13] = [
+    "Input",
+    "Split",
+    "Concat",
+    "Add",
+    "PReLU",
+    "Convolution",
+    "Interp",
+    "Warp",
+    "BinaryOp",
+    "DepthToSpace",
+    "PixelShuffle",
+    "UnaryOp",
+    "InnerProduct",
+];
 
 /// Builds a three-level coarse-to-fine interpolation network.
 ///
@@ -708,7 +737,7 @@ impl Model {
             .filter(|layer| {
                 !matches!(
                     layer.kind.as_str(),
-                    "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp" | "DepthToSpace"
+                    "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp" | "DepthToSpace" | "PixelShuffle" | "UnaryOp" | "InnerProduct"
                 )
             })
             .map(|layer| format!("{} ({})", layer.kind, layer.name))
@@ -905,10 +934,103 @@ impl Model {
                     let divisor = layer.option(0).map(|value| value as f32).unwrap_or(2.0);
                     blobs.insert(top, warp_by_flow(input, flow, divisor));
                 }
-                "DepthToSpace" => {
+                // `PixelShuffle` is ncnn's name for the same rearrangement, and a real
+                // RIFE checkpoint writes it that way: `PixelShuffle ... 0=2`.
+                "DepthToSpace" | "PixelShuffle" => {
                     let input = bottom(0)?;
                     let scale = layer.option(0).unwrap_or(1).max(1) as usize;
                     blobs.insert(top, depth_to_space(input, scale)?);
+                }
+                "UnaryOp" => {
+                    // ncnn's op_type. A real checkpoint uses 0=1, which is negate, in
+                    // layers it names `Neg_*`.
+                    let op = layer.option(0).unwrap_or(0);
+                    let mut frame = bottom(0)?.clone();
+                    for value in frame.data.iter_mut() {
+                        *value = match op {
+                            0 => value.abs(),
+                            1 => -*value,
+                            2 => value.floor(),
+                            3 => value.ceil(),
+                            4 => *value * *value,
+                            5 => value.sqrt(),
+                            7 => value.exp(),
+                            8 => {
+                                if *value <= 0.0 {
+                                    0.0
+                                } else {
+                                    value.ln()
+                                }
+                            }
+                            other => {
+                                return Err(ModelError::Shape(format!(
+                                    "`{}`: UnaryOp type {other} is not implemented",
+                                    layer.name
+                                )))
+                            }
+                        };
+                    }
+                    blobs.insert(top, frame);
+                }
+                "InnerProduct" => {
+                    // A real RIFE checkpoint uses this as a 1x1 convolution: 16 outputs
+                    // over 64 input channels is 1024 weights, and that is exactly what
+                    // the file declares. The check is the evidence, so a genuine
+                    // fully-connected layer is refused by name rather than run as
+                    // something it is not.
+                    let input = bottom(0)?;
+                    let out_channels = layer.num_output().ok_or_else(|| {
+                        ModelError::Shape(format!("`{}` has no num_output", layer.name))
+                    })?;
+                    let declared = layer.option(2).unwrap_or(0).max(0) as usize;
+                    let in_channels = input.channels;
+                    if declared != out_channels * in_channels {
+                        return Err(ModelError::Shape(format!(
+                            "`{}`: {declared} weights is not {out_channels} x {in_channels}, so \
+                             this is a fully-connected layer rather than the 1x1 convolution \
+                             this evaluator implements",
+                            layer.name
+                        )));
+                    }
+                    let need = declared + out_channels;
+                    let weights = self.weights.get(cursor..cursor + need).ok_or_else(|| {
+                        ModelError::Weights(format!("`{}` runs past the end", layer.name))
+                    })?;
+                    cursor += need;
+                    let bias_at = declared;
+                    let mut output = Planar::new(input.width, input.height, out_channels);
+                    let activation = layer.option(9).unwrap_or(0);
+                    let slope = layer.float_option(10).unwrap_or(0.1);
+                    for y in 0..input.height {
+                        for x in 0..input.width {
+                            for oc in 0..out_channels {
+                                let mut sum = weights[bias_at + oc];
+                                for ic in 0..in_channels {
+                                    sum += weights[oc * in_channels + ic] * input.at(ic, x, y);
+                                }
+                                let value = match activation {
+                                    0 => sum,
+                                    // LeakyReLU, which is what 9=2 means and what the
+                                    // real file uses on these layers.
+                                    2 => {
+                                        if sum < 0.0 {
+                                            sum * slope
+                                        } else {
+                                            sum
+                                        }
+                                    }
+                                    other => {
+                                        return Err(ModelError::Shape(format!(
+                                            "`{}`: activation {other} is not implemented",
+                                            layer.name
+                                        )))
+                                    }
+                                };
+                                output.set(oc, x, y, value);
+                            }
+                        }
+                    }
+                    blobs.insert(top, output);
                 }
                 other => {
                     return Err(ModelError::Shape(format!(
@@ -1437,6 +1559,11 @@ mod tests {
                     out * input * 9 + out
                 }
                 "PReLU" => layer.num_output().unwrap_or(0),
+                "InnerProduct" => {
+                    let out = layer.num_output().unwrap_or(0);
+                    let declared = layer.option(2).unwrap_or(0).max(0) as usize;
+                    out * declared + if layer.option(1).unwrap_or(1) == 0 { 0 } else { out }
+                }
                 _ => 0,
             };
         }

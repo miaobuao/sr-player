@@ -42,22 +42,14 @@ fn a_real_checkpoint_parses_and_reports_what_is_missing() {
             *kinds.entry(layer.kind.clone()).or_insert(0) += 1;
         }
         let model = &graph;
+        // The library's own list, not a copy of it here: a test that keeps its own
+        // The library's own list, not a copy of it here: a test that keeps its own idea
+        // of what is supported goes stale the moment the library grows, and then
+        // reports a gap that no longer exists. It did exactly that on the run which
+        // added three operators.
         let mut missing: BTreeMap<String, usize> = BTreeMap::new();
-        for layer in &model.layers {
-            if !matches!(
-                layer.kind.as_str(),
-                "Input"
-                    | "Split"
-                    | "Concat"
-                    | "Add"
-                    | "PReLU"
-                    | "Convolution"
-                    | "Interp"
-                    | "Warp"
-                    | "BinaryOp"
-                    | "DepthToSpace"
-                    | "PixelShuffle"
-            ) {
+        for layer in &graph.layers {
+            if !sr_infer_gpu::ifnet::SUPPORTED_KINDS.contains(&layer.kind.as_str()) {
                 *missing.entry(layer.kind.clone()).or_insert(0) += 1;
             }
         }
