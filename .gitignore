@@ -23,3 +23,7 @@
 
 # Scratch directories used while investigating (never part of the tree).
 /.sr-*/
+
+# Downloaded model checkpoints: large, licensed by their authors, never redistributed.
+/.sr-models/
+/models/

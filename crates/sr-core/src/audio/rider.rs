@@ -1211,6 +1211,52 @@ mod tests {
         }
     }
 
+    /// Does `split` replace its outputs, or add to them?
+    ///
+    /// This is the difference that matters between the two duck forms. Subtracting a
+    /// scaled mid band reads only `mid`; scaling the mid band and summing *replaces*
+    /// the signal with `low + mid*d + high`, so it depends on all three buffers
+    /// holding exactly this call's bands. If `split` appends — or leaves a longer
+    /// previous call's data in place — the two forms stop being equivalent, and the
+    /// one that reads three buffers is the one that breaks.
+    ///
+    /// The second call is deliberately *shorter* than the first: that is the case
+    /// where a buffer that is not cleared shows itself.
+    #[test]
+    fn split_replaces_its_outputs_rather_than_appending() {
+        use crate::audio::dsp::ThreeBandSplitter;
+        let mut splitter = ThreeBandSplitter::new(48_000, 300.0, 6_000.0);
+        let (mut low, mut mid, mut high) = (Vec::new(), Vec::new(), Vec::new());
+
+        let long = vec![0.1f32; 4_800];
+        splitter.split(&long, &mut low, &mut mid, &mut high);
+        assert_eq!(low.len(), long.len(), "the first call's bands are the right length");
+
+        let short = vec![0.2f32; 480];
+        splitter.split(&short, &mut low, &mut mid, &mut high);
+        assert_eq!(
+            (low.len(), mid.len(), high.len()),
+            (short.len(), short.len(), short.len()),
+            "a shorter call must leave shorter bands behind, not the previous call's"
+        );
+        // And the bands must be the *new* input's, not a mixture: a constant 0.2 has
+        // to produce bands that sum to it, which stale data from the 0.1 call would
+        // not.
+        let from = 240;
+        let summed: Vec<f32> = (from..short.len())
+            .map(|index| low[index] + mid[index] + high[index])
+            .collect();
+        let worst = summed
+            .iter()
+            .map(|value| (value - 0.2).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-3,
+            "the bands must describe the input that was just passed in; worst \
+             deviation {worst}"
+        );
+    }
+
     #[test]
     fn twelve_seconds_of_six_channels_stays_bounded() {
         // The pipeline runs a whole runtime in 100 ms blocks; unit tests here ran
