@@ -111,17 +111,66 @@ to almost nothing; a network that synthesises it does not. `restore_image_test`
 measures the same property in isolation (30.28 levels from a bilinear upscale), and
 this confirms it survives the whole product path.
 
-### Efficiency finding, not yet acted on
+### Efficiency, since acted on
 
-Restoration produces 2880x1920 (4x of the 720x480 source) and the resize to the
-final 1620x1080 canvas happens in the encoder's post-chain, **after** RIFE. So the
-interpolator runs on 5.5 megapixels where the deliverable is 1.7 — 3.2x the work
-per frame, for 239 frames, which is most of the 749 seconds above.
+Restoration produced 2880x1920 (4x of the 720x480 source) and the resize to the
+1620x1080 canvas happened **after** RIFE, so the interpolator ran on 3.2x the pixels
+the deliverable needs. That was fixed in two steps -- first moving the resize between
+restoration and interpolation, then choosing the model's input size from the canvas
+so it lands on the canvas directly:
 
-Resizing to the target canvas between restoration and interpolation would remove
-that, and it is what "exact deterministic target-canvas resizing" in the objective
-is asking for. It is also not purely an optimisation: it changes what RIFE sees, so
-it needs a quality comparison before being adopted rather than after.
+    749.4 s  ->  617.9 s  ->  414.3 s
+
+The first step was adopted on a measurement that turned out to be noise (see below);
+the second on a 33% wall-clock reduction, with no quality claim attached, because the
+proxy that would have supported one is not valid.
+
+## Restoration QC, and a result that needs a product decision
+
+Both fixtures below are built the same way: a known 1620x1080 original, downscaled
+to 720x480 with Lanczos, then put through `--profile safe-16gb --interpolate off`.
+Fidelity is PSNR against the original; "detail" is the mean PNG size of five frames,
+which measures high-frequency content and **not** correctness.
+
+### Synthetic fixture (testsrc2 blended with mandelbrot)
+
+| | PSNR vs original | detail (mean PNG) |
+|---|---|---|
+| Lanczos upscale | 37.05 dB | 864,362 |
+| the pipeline | 33.08 dB | 5,297,118 |
+
+### Photographic fixture (a real 1620x1080 photograph)
+
+| | PSNR vs original | detail (mean PNG) |
+|---|---|---|
+| original | — | 1,762,600 |
+| Lanczos upscale | 33.69 dB | 1,174,080 |
+| the pipeline | 28.48 dB | 4,971,358 |
+
+### What this says
+
+**On both fixtures restoration scores several dB below a plain Lanczos upscale on
+PSNR, while carrying several times the detail — including more detail than the
+original itself.** 4,971,358 bytes against the photograph's own 1,762,600 is not
+recovery of detail; it is detail that was not there to recover.
+
+That is what a generative restorer does, and PSNR is known to punish exactly the
+sharpening that makes such output look better to a person. So this is **not** a
+verdict that the model is wrong. It is a statement that:
+
+* **the two objectives are in tension and the product currently chooses one without
+  saying so.** `safe_16gb` applies restoration unconditionally. On a clean,
+  well-mastered source that has merely been downscaled, the model is being asked to
+  restore degradation that is not present, and it obliges.
+* **the sharpness proxy used in an earlier round was not valid.** It can rise sixfold
+  while fidelity falls four decibels. That claim has been withdrawn from the commit
+  it appeared in.
+* **this is the input Phase 3's "automatic restoration/scale decisions" needs.** A
+  decision about *whether* to restore, not only at what scale, requires either a
+  degradation estimate or an acceptance that restoration is a stylistic choice.
+
+Settling which of those is right needs the AI visual QC in the completion bar. The
+numbers above are a specification for it, not a substitute.
 
 ## Defects found by doing the work above
 
