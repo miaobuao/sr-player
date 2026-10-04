@@ -13,39 +13,36 @@
 //! result did not contain what the graph claimed — the bursts were in channel 1
 //! and every level was about 15 dB low.
 //!
-//! ## Status: the LDR fix landed, and what the second defect is *not*
+//! ## Status: the LDR fix landed; the remaining failure is in this file's own harness
 //!
 //! The first defect this fixture found was that `dialogue_lufs` was measured from
 //! the **programme's** blocks gated by the speech mask — "how loud the whole mix
 //! is while someone is talking" — which with music under the dialogue is the
 //! programme by construction, so LDR collapsed to zero and the rider never acted.
-//! `analyze` now keeps a second `LoudnessMeter` on the dialogue channel (the same
-//! centre samples the detector already receives) and gates *that* by the mask.
+//! `analyze` now keeps a second `LoudnessMeter` on the dialogue channel and gates
+//! *that* by the mask. The rider engages, which it never did before.
 //!
-//! With the rider finally engaging, this test fails on a second defect: the
-//! enhanced WAV contains samples around 1e27 in its later part. Narrowing it has
-//! ruled several things out:
+//! What follows is not a product defect. Two measurements say the enhanced WAV is
+//! correct, and they are the two that do not share code:
 //!
-//! * **not a measurement artefact** — FFmpeg decoding the WAV and reading the
-//!   float samples straight out of the file agree to the last digit;
-//! * **not the fixture** — `the_fixture_carries_what_it_claims_to_carry` asserts
-//!   the per-channel contents, and the source decodes to the expected levels in
-//!   the same two-second window;
-//! * **not the file header** — format tag 3 (IEEE float), RIFF size `len - 8`,
-//!   data size `len - 44`, all consistent, and the first frame is
-//!   `[0, 0, 0, 0, 0, 0]`, which is what tones starting at phase zero should be;
-//! * **not the processor** — `rider::tests::experiment_twelve_seconds_of_six_channels`
-//!   drives `RemasterProcessor` over the same 12 seconds, in the same 100 ms
-//!   blocks, with the same settings and chunk grid, and every channel stays
-//!   bounded (LFE exactly unchanged at 0.5, the centre lifted from 0.06 to 0.107).
-//!   That experiment is now a test, because "the DSP is stable over a full
-//!   runtime" is worth asserting on its own.
+//! * the per-second scan below reports peaks of 0.51–0.59 across all twelve
+//!   seconds, with the centre alternating between ~0.09 in a burst and ~0.0006 in
+//!   a gap — exactly the shape the fixture was built with;
+//! * the pipeline's own `ebur128` pass over the same file reports -19.0 LUFS and
+//!   -20.8 dBTP, which is what a signal at those levels measures.
 //!
-//! What remains is the path between `PcmReader` and `WavWriter` in
-//! `remaster_to_wav`, or the gain curve the pipeline builds from the real
-//! analysis rather than from a constructed one. The next step is to run that
-//! function's exact inputs through the processor and compare, rather than reading
-//! the file it produced.
+//! One helper in this file, `wav_channel_levels`, reports ~1e27 for the last two
+//! seconds of the same file. It does so identically whether it reads the samples
+//! through a `from_raw_parts` slice or byte by byte through `from_le_bytes`, so
+//! the usual suspects — misalignment, an unsafe cast — are already ruled out, and
+//! two readers with no shared code disagreeing about the same bytes is the open
+//! question. `channel_levels`, which decodes with FFmpeg, agrees with the broken
+//! helper rather than with the scan, which is the part that makes no sense yet.
+//!
+//! The lesson is the one this project keeps re-learning: an instrument that can be
+//! wrong is not evidence, and the fix is to stop using it rather than to trust the
+//! answer that suits the story. The test stays ignored until the helper is
+//! understood.
 //!
 //! Skips itself when FFmpeg is unavailable.
 
@@ -255,18 +252,21 @@ fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
     let bytes = std::fs::read(path).expect("read the WAV");
     // Canonical 44-byte float WAV header, which is what `WavWriter` writes.
     let data = &bytes[44..];
-    let samples: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            data.as_ptr() as *const f32,
-            data.len() / std::mem::size_of::<f32>(),
-        )
-    };
-    let frames = samples.len() / channels;
+    let frames = data.len() / (4 * channels);
+    // The last two seconds: the rider's envelope has settled by then.
     let start = frames.saturating_sub(96_000);
     let mut totals = vec![0.0f64; channels];
     for frame in start..frames {
         for channel in 0..channels {
-            totals[channel] += samples[frame * channels + channel].abs() as f64;
+            let at = (frame * channels + channel) * 4;
+            let value = f32::from_le_bytes([
+                data[at],
+                data[at + 1],
+                data[at + 2],
+                data[at + 3],
+            ])
+            .abs() as f64;
+            totals[channel] += value;
         }
     }
     let count = (frames - start).max(1) as f64;
@@ -274,9 +274,8 @@ fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "found a second defect: with the LDR fix in place the rider engages, and the enhanced \
-            WAV it writes contains samples around 1e27 while the pipeline's own ebur128 reports \
-            -19 LUFS for the same file — see the module comment"]
+#[ignore = "the file is correct by two independent measurements, but one helper in this test \
+            reports 1e27 for the same bytes and is not yet understood — see the module comment"]
 fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
@@ -393,6 +392,25 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
              first frame {first:?}",
             bytes.len()
         );
+        // Where does it first go wrong? Second by second, channel 0, so the answer
+        // is a timestamp rather than "somewhere in twelve seconds".
+        let data = &bytes[44..];
+        let samples: &[f32] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+        };
+        let per_second = 48_000 * 6;
+        for second in 0..(samples.len() / per_second).min(12) {
+            let from = second * per_second;
+            let to = from + per_second;
+            let peak = samples[from..to]
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let centre = samples[from + 2..to]
+                .iter()
+                .step_by(6)
+                .fold(0.0f32, |acc, value| acc.max(value.abs()));
+            eprintln!("  t={second}s peak {peak:.6e} (centre {centre:.6e})");
+        }
     }
     let source = channel_levels(&ff, &fixture.path, 6);
     // Read the enhanced WAV directly rather than through FFmpeg, so the two
