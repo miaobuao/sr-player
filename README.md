@@ -206,6 +206,10 @@ both original tracks**, the subtitle, the attachment and both chapters.
 
 ## Status
 
+**[`docs/status.md`](docs/status.md) is the current, honest assessment** — what is
+verified with evidence, what is assumed, and what has never been attempted. Read it
+before trusting anything below.
+
 | capability | state | evidence |
 |---|---|---|
 | Cadence: telecine, interlaced, PAL | **works** — 60 → 48 → 95 frames at 47.952 on a real pulldown | `cadence_corpus.rs` |
@@ -214,15 +218,20 @@ both original tracks**, the subtitle, the attachment and both chapters.
 | Dialogue rider on 5.1 | acts on the centre, leaves the LFE bit-exact | `audio::rider` unit tests; the end-to-end test is `#[ignore]`d |
 | QC accepts a late-starting source | normalises the offset instead of failing | `corpus_timing.rs` |
 | Encoder chain fallback on a broken vendor encoder | falls through the chain | `runner.rs` |
-| **RIFE interpolation** | **not built.** Requesting it fails before a pixel moves | `plan.rs` refuses; `segments.rs` holds the cut-safety contract it must meet |
-| **Real-ESRGAN restoration** | **not built.** Requesting it fails before a pixel moves | `plan.rs` refuses |
-| Learned models of any kind | **none in the tree.** `native/sr-native` and `models/` do not exist yet | — |
+| **RIFE 4.25 interpolation** | **works.** `ensemble = false`, on Vulkan, through the product | `rife_pair_test`; `docs/verification.md` |
+| **Real-ESRGAN x4plus restoration** | **works**, in process, tiled | `restore_image_test`; `docs/verification.md` |
+| Forced termination, late, with models | **works** — killed at 2 of 4 chunks, resumed reusing exactly those 2, byte-identical output | `cli_models.rs` |
+| No Python / CUDA / TensorRT / PyTorch / ONNX | **verified against the binary**, not asserted | `docs/verification.md` |
+| Vendor independence | **partial.** Runs on this machine's AMD integrated GPU; no Intel, no discrete AMD | `docs/verification.md` |
+| Phase 4 audio: VAD, 5.1 rewrite, M/S stereo | **not built** | — |
+| AI visual QC | **not built** | — |
+| A full-length unattended film | **never attempted.** ~52× realtime | — |
 
-**Nothing in this tree should be read as "the quality chain is done."** The
-quality chain is exactly the part that is missing, and the tests above are
-evidence about the *media engine* — cadence, timing, geometry, channels, resume —
-not about picture quality. One test is ignored, with its reason in the code: the
-audio channel-plan measurement contradicts its own evidence.
+**Nothing in this tree should be read as "the quality chain is done."** The models
+run and are tested; whether the restoration stage is *worth running* is unresolved,
+and the measurements say it may not be on clean sources — see `docs/status.md`.
+One audio test is ignored, with its reason in the code: the audio channel-plan
+measurement contradicts its own evidence.
 
 ## Deliberate limitations
 
