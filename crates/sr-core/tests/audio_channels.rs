@@ -13,7 +13,7 @@
 //! result did not contain what the graph claimed — the bursts were in channel 1
 //! and every level was about 15 dB low.
 //!
-//! ## Status: the LDR fix landed; the remaining failure is in this file's own harness
+//! ## Status: the LDR fix landed, and the enhanced track is corrupt at its tail
 //!
 //! The first defect this fixture found was that `dialogue_lufs` was measured from
 //! the **programme's** blocks gated by the speech mask — "how loud the whole mix
@@ -22,27 +22,35 @@
 //! `analyze` now keeps a second `LoudnessMeter` on the dialogue channel and gates
 //! *that* by the mask. The rider engages, which it never did before.
 //!
-//! What follows is not a product defect. Two measurements say the enhanced WAV is
-//! correct, and they are the two that do not share code:
+//! The second is a real defect in the enhanced WAV, and it took far too long to
+//! localise because two rounds of it were spent arguing with my own measurements.
+//! The per-second scan below prints a peak per second, and I read only its first ten
+//! lines — once through a `Select-Object -First` that cut the output, and once by
+//! assuming a twelve-second print meant twelve good seconds. Measured now, in one
+//! run over one file:
 //!
-//! * the per-second scan below reports peaks of 0.51–0.59 across all twelve
-//!   seconds, with the centre alternating between ~0.09 in a burst and ~0.0006 in
-//!   a gap — exactly the shape the fixture was built with;
-//! * the pipeline's own `ebur128` pass over the same file reports -19.0 LUFS and
-//!   -20.8 dBTP, which is what a signal at those levels measures.
+//! ```text
+//! t=0s  peak 5.9e-1        t=6s  peak 5.6e-1
+//! t=1s  peak 5.1e-1        t=7s  peak 5.1e-1
+//! ...                      t=9s  peak 5.6e-1
+//! enhanced raw (last two seconds): [3.0e27, 3.5e18, 7.3e17, 3.6e24, 3.9e27, 7.9e23]
+//! ```
 //!
-//! One helper in this file, `wav_channel_levels`, reports ~1e27 for the last two
-//! seconds of the same file. It does so identically whether it reads the samples
-//! through a `from_raw_parts` slice or byte by byte through `from_le_bytes`, so
-//! the usual suspects — misalignment, an unsafe cast — are already ruled out, and
-//! two readers with no shared code disagreeing about the same bytes is the open
-//! question. `channel_levels`, which decodes with FFmpeg, agrees with the broken
-//! helper rather than with the scan, which is the part that makes no sense yet.
+//! So the track is correct for ten seconds and contains values of order `1e27` in
+//! its last two. Every reader agrees on that — the library's own `PcmBuffer::read_wav`
+//! and FFmpeg's decoder both report it — which is the point: the disagreement I spent
+//! two rounds on was between a reader and a *truncated look at a scan*, not between
+//! two readers.
 //!
-//! The lesson is the one this project keeps re-learning: an instrument that can be
-//! wrong is not evidence, and the fix is to stop using it rather than to trust the
-//! answer that suits the story. The test stays ignored until the helper is
-//! understood.
+//! What is still unexplained is why the pipeline's own `ebur128` pass over the same
+//! file reports -19.0 LUFS and -20.8 dBTP. That is the remaining question, and it is
+//! a question about the measurement rather than about the file: a signal at `1e27`
+//! cannot measure -19 LUFS.
+//!
+//! The likely shape of the bug is the tail of the streamed remaster — `WavWriter`
+//! patches the header after the fact, and the last blocks are where a streaming
+//! writer, a partial block, or a double flush would show up. That is a hypothesis;
+//! what is measured is the split point, ten seconds in.
 //!
 //! Skips itself when FFmpeg is unavailable.
 
@@ -244,29 +252,33 @@ fn the_fixture_carries_what_it_claims_to_carry() {
     );
 }
 
-/// The same measurement, read straight out of the float WAV our own writer made.
+/// The same measurement, read with the library's own WAV reader.
 ///
-/// Two independent readers of the same bytes: if they disagree, the disagreement
-/// is the finding.
+/// This used to be a hand-rolled parser that assumed a canonical 44-byte header and
+/// indexed raw bytes as `f32`. It reported values around 1e27 for the last two
+/// seconds of a file that FFmpeg's `ebur128` measured at -19 LUFS, and an inline
+/// per-second scan of the same bytes reported peaks of 0.5. Two readers of the same
+/// file disagreeing is only ever a statement about the readers, and the one that was
+/// wrong was mine.
+///
+/// The product already had a WAV reader. Using it means a disagreement with FFmpeg is
+/// a statement about the product - which is what a test should be able to say - and
+/// that the header layout, the sample format and the frame count are parsed in one
+/// place instead of two.
 fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
-    let bytes = std::fs::read(path).expect("read the WAV");
-    // Canonical 44-byte float WAV header, which is what `WavWriter` writes.
-    let data = &bytes[44..];
-    let frames = data.len() / (4 * channels);
+    let buffer = sr_core::audio::pcm::PcmBuffer::read_wav(path).expect("read the WAV");
+    assert_eq!(
+        buffer.channels as usize, channels,
+        "the enhanced track has {} channels, not the {channels} the test asked for",
+        buffer.channels
+    );
+    let frames = buffer.frames();
     // The last two seconds: the rider's envelope has settled by then.
     let start = frames.saturating_sub(96_000);
     let mut totals = vec![0.0f64; channels];
     for frame in start..frames {
         for channel in 0..channels {
-            let at = (frame * channels + channel) * 4;
-            let value = f32::from_le_bytes([
-                data[at],
-                data[at + 1],
-                data[at + 2],
-                data[at + 3],
-            ])
-            .abs() as f64;
-            totals[channel] += value;
+            totals[channel] += buffer.samples[frame * channels + channel].abs() as f64;
         }
     }
     let count = (frames - start).max(1) as f64;
@@ -274,8 +286,10 @@ fn wav_channel_levels(path: &Path, channels: usize) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "the file is correct by two independent measurements, but one helper in this test \
-            reports 1e27 for the same bytes and is not yet understood — see the module comment"]
+
+
+#[ignore = "the enhanced WAV is correct for ten seconds and holds values of order 1e27 in its 
+            last two: a real defect in the streamed remaster's tail, not yet found"]
 fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;
