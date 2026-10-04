@@ -34,10 +34,10 @@ void check(bool condition, const char* what)
         failures++;
 }
 
-const int kW = 192;
-const int kH = 128;
+const int kW = 960;
+const int kH = 640;
 // Wide enough that the network's padding cannot reach the measured region.
-const int kBorder = 20;
+const int kBorder = 40;
 
 const double kPi = 3.14159265358979323846;
 
