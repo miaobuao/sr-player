@@ -187,18 +187,10 @@ impl<'a> NativeExecutor<'a> {
     pub fn run(&self, ctx: &NativeContext<'_>) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
 
-        // Restoration is still Phase 3. `build_plan` refuses it before reaching
-        // here, and the check is repeated at the point of execution on purpose:
-        // "nothing is substituted" has to hold where the pixels are, not only
-        // where the plan was drawn up.
-        if video.restoration.enabled {
-            return Err(Error::Stage {
-                stage: Stage::Restore.id().into(),
-                detail: "the plan asks for Real-ESRGAN restoration but this binary contains no AI \
-                         runtime; refusing to publish a file that only looks restored"
-                    .into(),
-            });
-        }
+        // One runtime serves both models. It is opened when either is wanted, and
+        // held for the whole run because a Vulkan instance is not worth paying for
+        // per chunk.
+        let wants_restoration = video.restoration.enabled;
 
         // ---- the interpolator -------------------------------------------------
         //
@@ -209,7 +201,7 @@ impl<'a> NativeExecutor<'a> {
         // which card is number zero.
         let wants_interpolation = video.interpolation.enabled
             && video.interpolation.method == InterpolationMethod::Rife;
-        let runtime = if wants_interpolation {
+        let runtime = if wants_interpolation || wants_restoration {
             Some(std::sync::Arc::new(
                 ai::Runtime::open_preferred().map_err(|err| Error::Stage {
                     stage: Stage::Interpolate.id().into(),
@@ -298,7 +290,7 @@ impl<'a> NativeExecutor<'a> {
             });
         }
 
-        let mut outcome = self.execute_chunks(ctx, &run_plan, multiplier, rife.as_mut())?;
+        let mut outcome = self.execute_chunks(ctx, &run_plan, multiplier, rife.as_mut(), runtime.as_ref())?;
         outcome.output = self.finalize(ctx, &run_plan)?;
         Ok(outcome)
     }
@@ -309,6 +301,7 @@ impl<'a> NativeExecutor<'a> {
         run_plan: &RunPlan,
         multiplier: u32,
         mut rife: Option<&mut ai::Rife>,
+        runtime: Option<&std::sync::Arc<ai::Runtime>>,
     ) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
         let chunks_dir = ctx.workdir.join("chunks");
@@ -331,7 +324,47 @@ impl<'a> NativeExecutor<'a> {
         let model_size = model_output_geometry(video);
         let frame_bytes = width as usize * height as usize * 3;
 
-        let mut source = FrameSource::new(stdout, frame_bytes, width, height);
+        // The restoration model, if the plan asks for one. Opened here rather than
+        // in run() because this is where the frames are, and it is opened once for
+        // the whole run.
+        let (restorer, scale, tile) = match (video.restoration.enabled, runtime) {
+            (true, Some(runtime)) => {
+                let scale = video.restoration.scale.max(1) as i32;
+                let restorer = runtime
+                    .open_restorer(&ai::restore_model_dir())
+                    .map_err(|err| Error::Stage {
+                        stage: Stage::Restore.id().into(),
+                        detail: format!(
+                            "restoration was requested but {err}. Run \
+                             native/sr-native/setup-third-party.ps1 to install the pinned weights."
+                        ),
+                    })?;
+                let tile = video.restoration.tile as i32;
+                ctx.reporter.info(
+                    Some(Stage::Restore),
+                    format!(
+                        "restoration open: {}x on {} ({}x{} -> {model_size:?} source raster {width}x{height})",
+                        scale,
+                        runtime.device().name,
+                        width,
+                        height,
+                    ),
+                );
+                (Some(restorer), scale, tile)
+            }
+            _ => (None, 1, 0),
+        };
+
+        let mut source = FrameSource::new(
+            stdout,
+            frame_bytes,
+            width,
+            height,
+            restorer,
+            scale,
+            tile,
+            model_size,
+        );
         let existing = self.committed_chunks(ctx.job_id)?;
 
         let mut outcome = NativeOutcome {
@@ -700,6 +733,16 @@ struct FrameSource {
     eof: bool,
     /// Frames invented because the stream ended before the plan did.
     padded: u64,
+    /// The restoration model, if this run asks for one. Owned here so that every
+    /// frame the pipeline sees is already restored -- including the one the carry
+    /// holds for the next segment, which is what stops a restored frame meeting an
+    /// unrestored one at a segment boundary and showing up as a flicker.
+    restorer: Option<ai::Restorer>,
+    scale: i32,
+    /// Tile edge in pixels; 0 lets the runtime choose.
+    tile: i32,
+    /// The geometry once the model has run: the source raster times the scale.
+    restored_size: (u32, u32),
 }
 
 impl FrameSource {
@@ -708,6 +751,10 @@ impl FrameSource {
         frame_bytes: usize,
         width: u32,
         height: u32,
+        restorer: Option<ai::Restorer>,
+        scale: i32,
+        tile: i32,
+        restored_size: (u32, u32),
     ) -> Self {
         FrameSource {
             reader,
@@ -720,6 +767,10 @@ impl FrameSource {
             frames_read: 0,
             eof: false,
             padded: 0,
+            restorer,
+            scale,
+            tile,
+            restored_size,
         }
     }
 
@@ -762,8 +813,76 @@ impl FrameSource {
         }
         self.frames_read += 1;
         let frame = Frame::from_owned(buffer, self.width, self.height);
+        let frame = self.restore(frame)?;
         self.last = Some(frame.clone());
         Ok(frame)
+    }
+
+    /// Runs the restoration model over a freshly decoded frame.
+    ///
+    /// Applied here, where frames are created, rather than at the call sites: the
+    /// carry and the repeat-last path then hold restored frames for free, and every
+    /// segment kind -- hold, pass and synthesise -- gets them without knowing the
+    /// model exists.
+    fn restore(&mut self, mut frame: Frame) -> Result<Frame> {
+        let Some(restorer) = self.restorer.as_mut() else {
+            return Ok(frame);
+        };
+        let (out_w, out_h) = self.restored_size;
+        let mut output = vec![0u8; out_w as usize * out_h as usize * 3];
+
+        // The tile ladder. Only an allocation failure is a capacity problem; a
+        // missing model or a lost device is not improved by trying a smaller tile,
+        // and retrying either would just burn time before reporting the same error.
+        let mut tile = self.tile;
+        loop {
+            let mut input =
+                ai::FrameView::new(&mut frame.data, frame.width as i32, frame.height as i32);
+            let mut view = ai::FrameView::new(&mut output, out_w as i32, out_h as i32);
+            match restorer.restore(&mut input, &mut view, self.scale, tile) {
+                Ok(()) => break,
+                Err(err) if err.is_out_of_memory() => {
+                    let smaller = if tile == 0 { 512 } else { tile };
+                    let next = crate::pipeline::profile::TILE_LADDER
+                        .iter()
+                        .copied()
+                        .filter(|candidate| (*candidate as i32) < smaller)
+                        .max()
+                        .map(|value| value as i32);
+                    match next {
+                        Some(smaller) => {
+                            tile = smaller;
+                            continue;
+                        }
+                        None => {
+                            return Err(Error::Stage {
+                                stage: Stage::Restore.id().into(),
+                                detail: format!(
+                                    "restoration ran out of device memory at every tile size down \
+                                     to {} px for a {}x{} frame; nothing smaller can be offered",
+                                    smaller, frame.width, frame.height
+                                ),
+                            })
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(Error::Stage {
+                        stage: Stage::Restore.id().into(),
+                        detail: format!(
+                            "restoration failed on a {}x{} frame: {err}",
+                            frame.width, frame.height
+                        ),
+                    })
+                }
+            }
+        }
+
+        Ok(Frame {
+            data: output,
+            width: out_w,
+            height: out_h,
+        })
     }
 
     fn repeat_last(&mut self) -> Result<Frame> {

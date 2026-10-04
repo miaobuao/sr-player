@@ -619,14 +619,32 @@ fn require_restoration_runtime(settings: &RestorationSettings) -> Result<()> {
     if !settings.enabled {
         return Ok(());
     }
-    Err(Error::Unsupported(format!(
-        "restoration with {} was requested but no restoration network can run it: the native \
-         Real-ESRGAN runtime (native/sr-native over ncnn) is not built into this binary yet, and \
-         its weights are not installed. Nothing is substituted for it — the previous build \
-         resampled with Lanczos and reported it as restoration. Use the `deterministic` or \
-         `preview` profile to run the rest of the pipeline.",
-        settings.model
-    )))
+
+    // The runtime is linked; what can be absent is the weights or a device. Both
+    // refusals name which, because "restoration did not run" and "restoration did
+    // not run because you have not installed the model" are different problems and
+    // the user can only act on the second.
+    if !ai::models_installed() {
+        return Err(Error::Unsupported(format!(
+            "restoration with {} was requested but its weights are not installed (looking in {}). \
+             Run:\n    \
+             powershell -NoProfile -ExecutionPolicy Bypass -File native\\sr-native\\setup-third-party.ps1\n\
+             Nothing is substituted for it — the previous build resampled with Lanczos and reported \
+             that as restoration. Use the `deterministic` or `preview` profile to run the rest of \
+             the pipeline.",
+            settings.model,
+            ai::restore_model_dir().display()
+        )));
+    }
+    if ai::preferred_device().is_none() {
+        return Err(Error::Unsupported(format!(
+            "restoration with {} was requested but no Vulkan device can host the model. The runtime \
+             reports {} device(s), none discrete with a usable budget. Nothing is substituted.",
+            settings.model,
+            ai::devices().len()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves the interpolation decision, refusing rather than substituting.
