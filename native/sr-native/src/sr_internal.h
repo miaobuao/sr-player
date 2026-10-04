@@ -61,6 +61,13 @@ inline const float* sr_channel(const ncnn::Mat& mat, int q)
 
 // Writes the `w x h` region of a planar float Mat whose origin is (src_x,
 // src_y) into `dst` at (dst_x, dst_y), clamped to 8-bit and honouring stride.
+//
+// `scale` maps the model's own value range onto 0..255, and it is a parameter
+// rather than a constant because the two networks here disagree: Real-ESRGAN
+// emits 0..1, RIFE emits 0..1 as well but its preprocessing divides by 255 on the
+// way in, so feeding it 0..255 is a 255x overdrive. Getting this wrong in either
+// direction produces a plausible-looking failure -- a saturated frame or a black
+// one -- rather than an error, which is why it is spelled out at every call site.
 inline void sr_planar_to_rgb8_region(const ncnn::Mat& mat,
                                      unsigned char* dst,
                                      int dst_stride,
@@ -69,7 +76,8 @@ inline void sr_planar_to_rgb8_region(const ncnn::Mat& mat,
                                      int src_x,
                                      int src_y,
                                      int w,
-                                     int h)
+                                     int h,
+                                     float scale)
 {
     const int mat_w = mat.w;
     const float* plane_r = sr_channel(mat, 0);
@@ -84,9 +92,9 @@ inline void sr_planar_to_rgb8_region(const ncnn::Mat& mat,
         const float* b = plane_b + (size_t)(src_y + y) * (size_t)mat_w + src_x;
         for (int x = 0; x < w; x++)
         {
-            out[x * 3 + 0] = sr_clamp_u8(r[x]);
-            out[x * 3 + 1] = sr_clamp_u8(g[x]);
-            out[x * 3 + 2] = sr_clamp_u8(b[x]);
+            out[x * 3 + 0] = sr_clamp_u8(r[x] * scale);
+            out[x * 3 + 1] = sr_clamp_u8(g[x] * scale);
+            out[x * 3 + 2] = sr_clamp_u8(b[x] * scale);
         }
     }
 }

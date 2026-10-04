@@ -116,7 +116,20 @@ void sr_rife_destroy(sr_rife* rife)
 
 namespace {
 
-// One padded input plane: `wp x hp x 3`, edge-replicated, scaled to 0..255.
+// One padded input plane: `wp x hp x 3`, edge-replicated, scaled to 0..1.
+//
+// 0..1, not 0..255. RIFE::process_v4 multiplies its 0..1 input by 255 and uploads
+// that, but the first thing the network's preprocessing does is
+//
+//     const float norm_val = 1 / 255.f;
+//     top_blob_data[...] = sfp(v * norm_val);
+//
+// (rife_preproc.comp), so the value the flownet actually sees is 0..1 again.
+// Feeding 0..255 therefore drives the network 255x past its range: the flow comes
+// out at +/-150..430 px for two identical frames, and the frame is a convex blend
+// of two warps of that garbage flow.
+//
+// The matching output scale of 255 lives at the call site below.
 ncnn::Mat build_padded_frame(const sr_image* image, int wp, int hp)
 {
     const int w = image->width;
@@ -135,9 +148,9 @@ ncnn::Mat build_padded_frame(const sr_image* image, int wp, int hp)
         for (int x = 0; x < wp; x++)
         {
             const int sx = std::min(x, w - 1);
-            r[x] = (float)row[sx * 3 + 0];
-            g[x] = (float)row[sx * 3 + 1];
-            b[x] = (float)row[sx * 3 + 2];
+            r[x] = (float)row[sx * 3 + 0] * (1.0f / 255.0f);
+            g[x] = (float)row[sx * 3 + 1] * (1.0f / 255.0f);
+            b[x] = (float)row[sx * 3 + 2] * (1.0f / 255.0f);
         }
     }
     return mat;
@@ -212,7 +225,8 @@ int sr_rife_process(sr_rife* rife,
                                  0,
                                  0,
                                  w,
-                                 band_h);
+                                 band_h,
+                                 255.0f);   // the network's output is 0..1
     }
 
     return SR_OK;

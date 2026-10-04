@@ -290,8 +290,18 @@ int main(int argc, char** argv)
     {
         int shift;
         float timestep;
+        // Whether "a blend of the two inputs" is a *wrong* answer here. Over a
+        // small shift of a smooth pattern the sinusoid is nearly linear, so the
+        // average of the two frames genuinely is the midpoint and comparing
+        // against it proves nothing. The flag says which cases can carry that
+        // assertion rather than weakening it everywhere.
+        bool blend_is_wrong;
     };
-    const Case cases[] = {{2, 0.5f}, {4, 0.25f}};
+    const Case cases[] = {
+        {2, 0.5f, false},
+        {8, 0.5f, true},
+        {4, 0.25f, true},
+    };
 
     for (const Case& c : cases)
     {
@@ -301,6 +311,8 @@ int main(int argc, char** argv)
         cases_run++;
         if (t > worst_truth)
             worst_truth = t;
+        if (!c.blend_is_wrong)
+            continue;
         const double gap = b - t;
         if (smallest_gap == 0.0 || gap < smallest_gap)
             smallest_gap = gap;
@@ -309,9 +321,9 @@ int main(int argc, char** argv)
     // The thresholds are stated as comparisons the test can justify, not as
     // numbers tuned until it went green: the synthesised frame has to be close
     // to the exact answer, and clearly closer to it than a blend of the inputs.
-    check(cases_run == 2, "both interpolation cases actually ran (a check must not pass vacuously)");
-    check(cases_run == 2 && worst_truth < 3.0, "the synthesised frame matches the exact midpoint");
-    check(cases_run == 2 && smallest_gap > 1.0,
+    check(cases_run == 3, "every interpolation case actually ran (a check must not pass vacuously)");
+    check(cases_run == 3 && worst_truth < 2.0, "the synthesised frame matches the exact midpoint");
+    check(smallest_gap > 1.0,
           "the synthesised frame beats a blend of the inputs by a clear margin "
           "(so a network ran, and the timestep was used)");
 
