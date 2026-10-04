@@ -108,7 +108,7 @@ impl Engine {
     /// It is a status line rather than a `(ready, total)` pair because there is
     /// nothing to count any more: exactly one runtime exists, and either it is
     /// built into this binary or the two model tasks are refused.
-    pub fn ai_runtime(&self) -> &'static str {
+    pub fn ai_runtime(&self) -> String {
         sr_core::pipeline::ai_runtime_line()
     }
 

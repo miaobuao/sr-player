@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 /// to change when the native runtime arrives: today there is none, so the honest
 /// answer is that no restoration and no interpolation can run, and the plan will
 /// refuse either rather than substitute something else.
-pub fn ai_runtime_line() -> &'static str {
-    "AI runtime: none in this build — restoration and interpolation are refused, not approximated"
+pub fn ai_runtime_line() -> String {
+    crate::ai::status_line()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

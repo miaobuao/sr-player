@@ -320,10 +320,20 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
                 None => RestorationProfile::safe_16gb(),
             };
             if let Some(method) = interpolate {
-                profile.interpolation.method =
-                    sr_core::pipeline::profile::InterpolationMethod::parse(method).ok_or_else(
-                        || sr_core::Error::Other(format!("unknown interpolation `{method}`")),
-                    )?;
+                let parsed = sr_core::pipeline::profile::InterpolationMethod::parse(method)
+                    .ok_or_else(|| {
+                        sr_core::Error::Other(format!("unknown interpolation `{method}`"))
+                    })?;
+                profile.interpolation.method = parsed;
+                // Asking for an interpolator while the multiplier stays at 1 is a
+                // request for nothing, and the planner would read it as "off".
+                // The product's film mode is 2x, so that is what a bare
+                // `--interpolate rife` means.
+                if parsed != sr_core::pipeline::profile::InterpolationMethod::Off
+                    && profile.interpolation.multiplier <= 1
+                {
+                    profile.interpolation.multiplier = 2;
+                }
             }
             if *no_audio {
                 profile.audio.enabled = false;

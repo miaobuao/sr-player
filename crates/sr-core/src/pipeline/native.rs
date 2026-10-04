@@ -37,6 +37,7 @@
 //! `m*(n-1)+1` frames, and the executor fails loudly if what it wrote disagrees
 //! with the plan. A short output is never published quietly.
 
+use crate::ai;
 use crate::error::{Error, Result};
 use crate::events::{Reporter, Stage, StageProgress};
 use crate::ffmpeg::process::{write_all, StreamingChild};
@@ -185,19 +186,11 @@ impl<'a> NativeExecutor<'a> {
     /// Runs the whole chunked video path and returns the finished output path.
     pub fn run(&self, ctx: &NativeContext<'_>) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
-        // `build_plan` refuses both of these already. The check is repeated at the
-        // point of execution on purpose: "nothing is substituted" has to hold
-        // where the pixels are, not only where the plan was drawn up, and a plan
-        // can also be constructed by hand or loaded from an older job.
-        if video.interpolation.enabled && video.interpolation.method == InterpolationMethod::Rife {
-            return Err(Error::Stage {
-                stage: Stage::Interpolate.id().into(),
-                detail: "the plan asks for RIFE interpolation but this binary contains no AI \
-                         runtime; refusing to publish a file whose frames are not the ones the \
-                         plan describes"
-                    .into(),
-            });
-        }
+
+        // Restoration is still Phase 3. `build_plan` refuses it before reaching
+        // here, and the check is repeated at the point of execution on purpose:
+        // "nothing is substituted" has to hold where the pixels are, not only
+        // where the plan was drawn up.
         if video.restoration.enabled {
             return Err(Error::Stage {
                 stage: Stage::Restore.id().into(),
@@ -207,12 +200,64 @@ impl<'a> NativeExecutor<'a> {
             });
         }
 
+        // ---- the interpolator -------------------------------------------------
+        //
+        // Opened only when the plan asks for it, and held for the whole run:
+        // opening RIFE costs a Vulkan instance and 12 MB of weights, which is not
+        // something to pay again per chunk. The device is the one the runtime
+        // reports, not the one the GPU probe reports — they need not agree on
+        // which card is number zero.
+        let wants_interpolation = video.interpolation.enabled
+            && video.interpolation.method == InterpolationMethod::Rife;
+        let runtime = if wants_interpolation {
+            Some(std::sync::Arc::new(
+                ai::Runtime::open_preferred().map_err(|err| Error::Stage {
+                    stage: Stage::Interpolate.id().into(),
+                    detail: format!(
+                        "interpolation was requested but no AI runtime can serve it: {err}"
+                    ),
+                })?,
+            ))
+        } else {
+            None
+        };
+        let mut rife = match &runtime {
+            Some(runtime) => Some(
+                runtime
+                    .open_rife(&ai::rife_model_dir())
+                    .map_err(|err| Error::Stage {
+                        stage: Stage::Interpolate.id().into(),
+                        detail: format!(
+                            "interpolation was requested but {err}. Run \
+                             native/sr-native/setup-third-party.ps1 to install the pinned weights."
+                        ),
+                    })?,
+            ),
+            None => None,
+        };
+        if let (Some(runtime), true) = (&runtime, rife.is_some()) {
+            ctx.reporter.info(
+                Some(Stage::Interpolate),
+                format!(
+                    "RIFE 4.25 open on {} (device {}, {:.1} GiB), ensemble off, {}x film mode",
+                    runtime.device().name,
+                    runtime.device().index,
+                    runtime.device().budget_mib as f64 / 1024.0,
+                    video.interpolation.multiplier.max(1)
+                ),
+            );
+        }
+
         // Every frame the decode pass will produce, according to the shot
         // analysis, which ran on the same cadence chain: the numbering matches by
         // construction rather than by hope.
         let input_frames = ctx.scenes.frames_analyzed;
-        let interpolate = false;
-        let multiplier = 1u32;
+        let interpolate = rife.is_some();
+        let multiplier = if interpolate {
+            video.interpolation.multiplier.max(1)
+        } else {
+            1
+        };
         let run_plan = plan_run(
             input_frames,
             multiplier,
@@ -253,7 +298,7 @@ impl<'a> NativeExecutor<'a> {
             });
         }
 
-        let mut outcome = self.execute_chunks(ctx, &run_plan, multiplier)?;
+        let mut outcome = self.execute_chunks(ctx, &run_plan, multiplier, rife.as_mut())?;
         outcome.output = self.finalize(ctx, &run_plan)?;
         Ok(outcome)
     }
@@ -263,6 +308,7 @@ impl<'a> NativeExecutor<'a> {
         ctx: &NativeContext<'_>,
         run_plan: &RunPlan,
         multiplier: u32,
+        mut rife: Option<&mut ai::Rife>,
     ) -> Result<NativeOutcome> {
         let video = &ctx.plan.video;
         let chunks_dir = ctx.workdir.join("chunks");
@@ -331,6 +377,7 @@ impl<'a> NativeExecutor<'a> {
                     segment,
                     &mut source,
                     multiplier,
+                    rife.as_deref_mut(),
                     &mut encoder,
                 )?;
             }
@@ -451,20 +498,82 @@ impl<'a> NativeExecutor<'a> {
         segment: &Segment,
         source: &mut FrameSource,
         multiplier: u32,
+        rife: Option<&mut ai::Rife>,
         encoder: &mut ChunkEncoder,
     ) -> Result<u64> {
         match segment.kind {
-            SegmentKind::Synthesise => Err(Error::Stage {
-                stage: Stage::Interpolate.id().into(),
-                detail: format!(
-                    "the segment plan asked for frames synthesised between input {} and {}, but \
-                     there is no interpolator in this binary to produce them. The segment \
-                     planner is complete — it is the executor's model stage that is missing — \
-                     and inventing the missing frames some other way is exactly what this build \
-                     no longer does.",
-                    segment.first, segment.last
-                ),
-            }),
+            SegmentKind::Synthesise => {
+                // The only place RIFE is called, and it is called with the two
+                // frames of one pair from inside one segment. The planner has
+                // already guaranteed that pair does not straddle a cut: a segment
+                // containing a boundary or a dissolve guard is `Hold`, not this.
+                //
+                // Frames are streamed with a single frame of lookahead rather than
+                // buffered, because a segment spans a whole shot — hundreds of
+                // 1080p frames is gigabytes.
+                let Some(rife) = rife else {
+                    return Err(Error::Stage {
+                        stage: Stage::Interpolate.id().into(),
+                        detail: format!(
+                            "the segment plan asked for frames synthesised between input {} and \
+                             {}, but no interpolator was opened for this run",
+                            segment.first, segment.last
+                        ),
+                    });
+                };
+                let m = multiplier.max(1) as u64;
+                let mut written = 0u64;
+                let mut first = true;
+                let mut carry: Option<Frame> = None;
+                let mut pending: Option<Frame> = None;
+
+                for index in segment.first..=segment.last {
+                    let frame = source.frame(index)?;
+                    if index == segment.last {
+                        carry = Some(frame.clone());
+                    }
+
+                    // The m-1 frames between the previous one and this one occupy
+                    // slots m*k+1 .. m*k+m-1, at timesteps j/m.
+                    if let Some(previous) = pending.take() {
+                        for j in 1..m {
+                            let timestep = j as f32 / m as f32;
+                            let mut out = vec![0u8; previous.data.len()];
+                            let mut view = ai::FrameView::new(
+                                &mut out,
+                                previous.width as i32,
+                                previous.height as i32,
+                            );
+                            rife.interpolate(&previous.data, &frame.data, timestep, &mut view)
+                                .map_err(|err| Error::Stage {
+                                    stage: Stage::Interpolate.id().into(),
+                                    detail: format!(
+                                        "RIFE failed on the pair at input frame {index} \
+                                         (timestep {timestep:.3}): {err}"
+                                    ),
+                                })?;
+                            encoder.write_frame(&out)?;
+                            written += 1;
+                        }
+                    }
+
+                    // The frames themselves land on slots m*k. The first is
+                    // dropped when the previous segment already wrote that slot;
+                    // its pair's intermediates are not, because those slots are
+                    // this segment's to emit.
+                    if !(first && segment.drop_first) {
+                        encoder.write_frame(&frame.data)?;
+                        written += 1;
+                    }
+                    first = false;
+                    pending = Some(frame);
+                }
+
+                if let Some(frame) = carry {
+                    source.set_carry(segment.last, frame);
+                }
+                Ok(written)
+            }
             SegmentKind::Hold => {
                 // Frames are repeated rather than synthesised, and a held region is
                 // streamed one frame at a time, so a long hold costs one frame of

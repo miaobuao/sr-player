@@ -5,6 +5,7 @@
 //! deinterlaced, why interpolation was disabled for a shot, or why the audio was
 //! left completely alone. "Zero tuning" only works if the reasoning is visible.
 
+use crate::ai;
 use crate::audio::loudness::AudioAnalysis;
 use crate::error::{Error, Result};
 use crate::ffmpeg::{EncoderPreference, Ffmpeg, SelectedAudioEncoder, SelectedVideoEncoder, VideoCodec};
@@ -654,13 +655,50 @@ fn resolve_interpolation(
         });
     }
 
-    Err(Error::Unsupported(format!(
-        "{}x interpolation was requested but no interpolator can run it: the native RIFE runtime \
-         (native/sr-native over ncnn) is not built into this binary yet. Nothing is substituted \
-         for it — pass `--interpolate off`, or choose a profile whose interpolation is off, if \
-         you want the rest of the pipeline to run.",
-        multiplier
-    )))
+    // RIFE was requested. It runs or the job is refused; there is still nothing in
+    // between, but now the two things that can be absent are the *weights* and a
+    // device that can host them, not the runtime itself, which is linked in.
+    if !ai::models_installed() {
+        return Err(Error::Unsupported(format!(
+            "{}x interpolation was requested but the pinned RIFE 4.25 weights are not installed \
+             (looking in {}). Run:\n    \
+             powershell -NoProfile -ExecutionPolicy Bypass -File native\\sr-native\\setup-third-party.ps1\n\
+             Nothing is substituted for them — pass `--interpolate off` to run the rest of the \
+             pipeline.",
+            multiplier,
+            ai::rife_model_dir().display()
+        )));
+    }
+    if ai::preferred_device().is_none() {
+        return Err(Error::Unsupported(format!(
+            "{}x interpolation was requested but no Vulkan device can host the model. The runtime \
+             reports {} device(s), none discrete with a usable budget. An integrated device's \
+             device-local memory is system RAM shared with the desktop, so it is not offered. \
+             Nothing is substituted.",
+            multiplier,
+            ai::devices().len()
+        )));
+    }
+
+    let post_ivtc = source_fps;
+    let target_fps = post_ivtc
+        .checked_mul(&Rational::from_i64(multiplier as i64))
+        .unwrap_or(post_ivtc);
+    Ok(InterpolationPlan {
+        enabled: true,
+        method: InterpolationMethod::Rife,
+        source_fps: post_ivtc,
+        target_fps,
+        multiplier,
+        scene_cuts_respected: profile.interpolation.scene_cut_protection,
+        note: format!(
+            "RIFE 4.25, ensemble off; {}x {:.3} -> {:.3} fps. A frame pair that straddles a cut is \
+             never constructed, so it cannot reach the model.",
+            multiplier,
+            post_ivtc.to_f64(),
+            target_fps.to_f64()
+        ),
+    })
 }
 
 /// The whole decision, in one place.
@@ -812,7 +850,7 @@ pub fn build_plan(
     // its neighbour, so a measured per-shot re-grain forces it. The model stage
     // will force it for the same reason — a network is not an FFmpeg filter —
     // but there is no model stage in this build, so nothing else does.
-    let executor = if regrain_per_shot.is_empty() {
+    let executor = if regrain_per_shot.is_empty() && !interpolation.enabled {
         VideoExecutor::FfmpegSinglePass
     } else {
         VideoExecutor::Chunked
@@ -1148,16 +1186,36 @@ mod tests {
     }
 
     #[test]
-    fn a_request_for_rife_is_refused_rather_than_answered_with_minterpolate() {
+    fn a_request_for_rife_is_served_by_rife_or_refused_without_a_substitute() {
+        // Phase 0 wrote this as "must be refused". The contract is unchanged in
+        // the part that matters -- there is still no third answer -- but the
+        // runtime is now linked, so what can be absent is the weights or a device
+        // rather than the implementation, and on a machine that has them the plan
+        // resolves to RIFE.
         let profile = RestorationProfile::safe_16gb();
-        let err = resolve_interpolation(&profile, Rational::new(24000, 1001).unwrap())
-            .expect_err("the default profile asks for RIFE and no runtime can serve it");
-        let text = err.to_string();
-        assert!(text.contains("RIFE"), "{text}");
-        assert!(
-            !text.contains("minterpolate") && !text.contains("duplicat"),
-            "the refusal must not offer a substitute algorithm: {text}"
-        );
+        let fps = Rational::new(24000, 1001).unwrap();
+        match resolve_interpolation(&profile, fps) {
+            Ok(plan) => {
+                assert!(plan.enabled, "the default profile asks for RIFE");
+                assert_eq!(plan.method, InterpolationMethod::Rife);
+                assert_eq!(plan.multiplier, profile.interpolation.multiplier.max(1));
+                assert!(
+                    plan.target_fps.to_f64() > fps.to_f64(),
+                    "an enabled interpolation plan must raise the cadence"
+                );
+            }
+            Err(err) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("weights are not installed") || text.contains("Vulkan device"),
+                    "a refusal must name what is missing: {text}"
+                );
+                assert!(
+                    !text.contains("minterpolate") && !text.contains("duplicat"),
+                    "the refusal must not offer a substitute algorithm: {text}"
+                );
+            }
+        }
     }
 
     #[test]
