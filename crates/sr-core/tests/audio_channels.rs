@@ -56,12 +56,24 @@
 //! move it, while a mean of absolute values is nothing but those six. Two statistics,
 //! one file, and no contradiction between them.
 //!
-//! The defect is bounded to thirty-six samples and it is **not** the reader: `next_block`
-//! allocates a zeroed buffer and truncates to whole frames, so a short final read gives
-//! silence rather than rubbish. The enhanced track has 576,006 frames against the
-//! fixture's 576,000, and the six extra ones are the six that are wrong — so the
-//! question is what put six frames of uninitialised memory at the end of a stream that
-//! was supposed to be padded with silence.
+//! The defect is the *length*: the remaster writes six frames more than the source has,
+//! and the six extra ones are uninitialised memory. Measured with FFmpeg on both files,
+//! same scan, same run:
+//!
+//! ```text
+//! fixture mkv:   3,456,000 samples = 12.000000s   last block peak 6.0e-1
+//! enhanced wav:  3,456,036 samples = 12.000125s   last block peak 3.0e32
+//! ```
+//!
+//! The fixture is exactly 576,000 frames and its tail is clean. The enhanced track is
+//! 576,006 — the decoder that `remaster_to_wav` drives returns six frames more than the
+//! file contains, and every one of them is written. `next_block` is not at fault: it
+//! allocates a zeroed buffer and truncates to whole frames, so it cannot invent samples.
+//! The overrun comes from the decode itself.
+//!
+//! The fix is a guard rather than a diagnosis: never publish more audio than the source
+//! declares, and say so when truncating. An unattended pipeline should not be able to
+//! append uninitialised samples because a decoder padded its output.
 //!
 //! Looking for where it enters turned up a second, unrelated limitation: the library's
 //! own `PcmBuffer::read_wav` **refuses a WAVE_FORMAT_EXTENSIBLE file** —
@@ -280,6 +292,46 @@ fn the_fixture_carries_what_it_claims_to_carry() {
     );
 }
 
+/// The last few blocks of a file, decoded with FFmpeg and printed in full.
+///
+/// The point is to see whether the *fixture* already ends in rubbish, in which case the
+/// product is innocent and the six frames came from upstream, or whether it ends
+/// cleanly, in which case the remaster path put them there.
+fn print_tail_blocks(ff: &Ffmpeg, path: &Path, channels: usize, label: &str) {
+    let output = std::process::Command::new(&ff.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-f",
+            "f32le",
+            "-ac",
+            &channels.to_string(),
+            "-",
+        ])
+        .output()
+        .expect("decode");
+    let samples: Vec<f32> = output
+        .stdout
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    let total = samples.len();
+    let block = 4_800 * channels;
+    eprintln!(
+        "{label}: {total} samples = {:.6}s; last three blocks:",
+        total as f64 / (48_000.0 * channels as f64)
+    );
+    let tail = total.saturating_sub(block * 3);
+    for (index, chunk) in samples[tail..].chunks(block).enumerate() {
+        let peak = chunk.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+        eprintln!(
+            "  {label} tail block {index}: peak {peak:.6e} ({} samples)",
+            chunk.len()
+        );
+    }
+}
 /// The same measurement, read with the library's own WAV reader.
 ///
 /// This used to be a hand-rolled parser that assumed a canonical 44-byte header and
@@ -479,32 +531,9 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
         );
         eprintln!("via the helper          : {:?}", wav_channel_levels(&enhanced, 6));
 
-        // The fixture, measured the same way. If its last frames are clean, the
-        // remaster path introduced the garbage; if they are not, something upstream of
-        // the product did and the product is innocent. The tail is thirty-six samples
-        // wide, so this looks at the last blocks rather than at seconds.
-        let wav_path = fixture.path.with_file_name("surround.wav");
-        let source =
-            sr_core::audio::pcm::PcmBuffer::read_wav(&wav_path).expect("read the fixture WAV");
-        let channels = source.channels as usize;
-        let total = source.samples.len();
-        eprintln!(
-            "fixture WAV: {} samples = {:.6}s at {} Hz, {} ch; last blocks:",
-            total,
-            total as f64 / (source.sample_rate as f64 * channels as f64),
-            source.sample_rate,
-            channels
-        );
-        let block = 4_800 * channels;
-        let tail = total.saturating_sub(block * 3);
-        for (index, chunk) in source.samples[tail..].chunks(block).enumerate() {
-            let peak = chunk.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
-            eprintln!(
-                "  fixture tail block {index}: peak {peak:.6e} ({} samples)",
-                chunk.len()
-            );
-        }
     }
+    print_tail_blocks(&ff, &fixture.path, 6, "fixture mkv");
+    print_tail_blocks(&ff, &enhanced, 6, "enhanced wav");
     let source = channel_levels(&ff, &fixture.path, 6);
     // Read the enhanced WAV directly rather than through FFmpeg, so the two
     // numbers come from two different readers and a disagreement is visible.
