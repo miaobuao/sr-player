@@ -306,7 +306,6 @@ fn run_and_measure(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path, job: &str) -> (f6
 /// mostly in luminance, and which lasts a frame or two, is a flash rather than a
 /// change of scene. It is recorded here rather than asserted away.
 #[test]
-#[ignore = "a one-frame flash is detected as a shot cut; the flash guard is not written yet"]
 fn a_flash_frame_does_not_split_a_shot() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;

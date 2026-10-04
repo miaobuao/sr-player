@@ -281,6 +281,9 @@ impl SceneDetector {
 
         // (1) Resolve a candidate held from the previous frame.
         let mut confirmed = false;
+        // The frame the previous one should be compared against, when a candidate
+        // turned out to be a flash.
+        let mut pre_flash: Option<GrayFrame> = None;
         if let Some(pending) = self.pending.take() {
             let persists = compare(&pending.reference, frame, &self.opts);
             if persists.mad >= self.opts.mad_threshold
@@ -291,19 +294,43 @@ impl SceneDetector {
                 self.recent_scores.clear();
                 self.elevated_run = 0;
                 confirmed = true;
+            } else {
+                // It was a flash: nothing is recorded and the score history
+                // continues undisturbed.
+                //
+                // The flash frame must not become the reference for the *next*
+                // comparison either, which is what let flashes through before. The
+                // transition out of a flash is as large as the transition into it,
+                // so the pair (flash, next) looks exactly like a cut from a bright
+                // scene to a dark one — and it is confirmed by its own persistence
+                // check, because the frame after it resembles the flash no more than
+                // the frame before it did. Holding the pre-flash frame as the
+                // reference makes the burst invisible, which is what it is.
+                pre_flash = Some(pending.reference);
             }
-            // Otherwise it was a flash: nothing is recorded and the score
-            // history continues undisturbed.
         }
 
-        // (2) Compare with the previous frame.
-        let (diff, threshold) = match (&self.prev, &self.prev_edges) {
+        // (2) Compare with the previous frame — or with the frame before the flash,
+        // when this one followed a flash.
+        //
+        // Skipping the flash frame here matters as much as skipping it as a
+        // reference: comparing against it arms a *new* candidate on the way out of
+        // the burst, whose persistence check then compares the frame after against
+        // the flash and confirms it. Rejecting the leading edge while arming the
+        // trailing one is how a flash became a cut.
+        let (against, against_edges) = match &pre_flash {
+            Some(pre_flash) => (
+                Some(pre_flash),
+                Some(pre_flash.edge_map(self.opts.edge_gradient_threshold)),
+            ),
+            None => (self.prev.as_ref(), self.prev_edges.clone()),
+        };
+        let (diff, threshold) = match (against, &against_edges) {
             (Some(prev), Some(prev_edges)) => {
                 let hist = histogram_distance(&prev.histogram(), &frame.histogram());
                 let edges = frame.edge_map(self.opts.edge_gradient_threshold);
                 let edge = edge_distance(prev_edges, &edges);
                 let mad = prev.mean_abs_diff(frame);
-                self.prev_edges = Some(edges);
                 (
                     FrameDiff {
                         histogram: hist,
@@ -313,13 +340,10 @@ impl SceneDetector {
                     self.adaptive_threshold(),
                 )
             }
-            _ => {
-                self.prev_edges = Some(frame.edge_map(self.opts.edge_gradient_threshold));
-                (
-                    FrameDiff::default(),
-                    self.opts.hard_histogram_threshold,
-                )
-            }
+            _ => (
+                FrameDiff::default(),
+                self.opts.hard_histogram_threshold,
+            ),
         };
 
         let score = Self::score(&diff);
@@ -353,11 +377,22 @@ impl SceneDetector {
             self.recent_scores.push_back(score);
         }
 
-        self.prev = Some(GrayFrame::new(
-            frame.width,
-            frame.height,
-            frame.data.clone(),
-        ));
+        // (3) Remember this frame, unless it was a flash — in which case the frame
+        // before it stays the reference, so the burst leaves no trace.
+        let (reference, edges) = match pre_flash {
+            Some(pre_flash) => {
+                let edges = pre_flash.edge_map(self.opts.edge_gradient_threshold);
+                (pre_flash, edges)
+            }
+            None => (
+                GrayFrame::new(frame.width, frame.height, frame.data.clone()),
+                self.prev_edges
+                    .clone()
+                    .unwrap_or_else(|| frame.edge_map(self.opts.edge_gradient_threshold)),
+            ),
+        };
+        self.prev = Some(reference);
+        self.prev_edges = Some(edges);
 
         FrameVerdict {
             frame_index: index,
