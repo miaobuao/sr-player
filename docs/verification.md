@@ -212,9 +212,16 @@ that changing an option starts a new job and discards committed chunks, which is
 the right trade: a chunk built under different settings is not a valid answer to
 the new question.
 
-### Open: the pre-run estimate is 80% wrong
+### Fixed: the pre-run workload estimate
 
-`429 frame(s) will be synthesised` and `214 call(s)` against an actual 239
-intermediates. The output is correct, so it is the planner's estimate rather than
-the executor's arithmetic — but a figure that overstates the work by that much is
-one nobody will trust.
+It read `429 frame(s) will be synthesised ... in 214 call(s)`. Two errors in one
+line: the frame count summed `emitted()` over Synthesise segments, which is every
+frame the segment *outputs* including the real ones, and the call count counted
+segments rather than calls. At 2x a call produces one frame, so those two numbers
+could not both be right — and that contradiction is the only reason it was ever
+noticed. A pair of figures that merely looked plausible would still be there.
+
+It now reads `214 frame(s) ... in 214 call(s)`: one call, one frame, and 214 of the
+239 pairs in the file, the remaining 25 held by the two cuts and their guards.
+A unit test recomputes both figures from the segment geometry and asserts the two
+agree at 2x, which is what makes the contradiction impossible to reintroduce.

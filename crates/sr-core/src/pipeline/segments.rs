@@ -279,19 +279,31 @@ pub fn plan_run(
              {guard}-frame guard either side of a gradual transition"
         ));
     }
-    let synthesised: u64 = segments
+    // How much work the model is actually given.
+    //
+    // Both figures here were wrong, and wrong in a way that contradicted each other.
+    // The frame count summed `emitted()` -- every frame the segment *outputs*,
+    // including the real ones -- and the call count counted segments rather than
+    // calls. At 2x a call produces one frame, so a report of "429 frame(s) ... in 214
+    // call(s)" was internally impossible, which is the only reason it was ever
+    // noticed; a plausible-looking pair of numbers would have sat there indefinitely.
+    //
+    // A call is one adjacent pair of input frames and produces `m - 1` frames, so
+    // both figures come from the segment geometry: a segment covering
+    // `first..=last` holds `last - first` pairs. `drop_first` does not enter into it,
+    // because it drops an emitted frame rather than a pair.
+    let (synthesised, calls): (u64, u64) = segments
         .iter()
         .filter(|s| s.kind == SegmentKind::Synthesise)
-        .map(|s| s.emitted())
-        .sum();
+        .fold((0u64, 0u64), |(frames, calls), segment| {
+            let pairs = segment.last.saturating_sub(segment.first);
+            let per_call = m.saturating_sub(1) as u64;
+            (frames + pairs * per_call, calls + pairs)
+        });
     if synthesised > 0 {
         notes.push(format!(
-            "{synthesised} frame(s) will be synthesised by the model, in {} call(s) of at most \
-             {window} input frames",
-            segments
-                .iter()
-                .filter(|s| s.kind == SegmentKind::Synthesise)
-                .count()
+            "{synthesised} frame(s) will be synthesised by the model, in {calls} call(s) of at \
+             most {window} input frames"
         ));
     }
 
@@ -512,6 +524,64 @@ mod tests {
         // The rate still doubles, but every segment is a Hold: no model call.
         assert!(plan.segments.iter().all(|s| s.kind == SegmentKind::Hold));
         assert_eq!(total_emitted(&plan), 99);
+    }
+
+    /// The reported model workload has to be arithmetic, not a plausible-looking pair
+    /// of numbers.
+    ///
+    /// What was here before: the frame count summed `emitted()` over Synthesise
+    /// segments — which is every frame the segment *outputs*, real ones included —
+    /// and the call count counted segments rather than calls. At 2x one call produces
+    /// one frame, so "429 frame(s) in 214 call(s)" was internally impossible. That
+    /// contradiction is the only reason it was caught; a pair of numbers that merely
+    /// looked reasonable would still be there.
+    #[test]
+    fn the_reported_model_workload_matches_the_segments() {
+        let list = shots(&[100], 200); // two shots, one cut
+        let plan = plan_run(200, 2, &list, &options(2));
+
+        // Recomputed the long way, from the segment geometry.
+        let (expected_frames, expected_calls) = plan
+            .segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::Synthesise)
+            .fold((0u64, 0u64), |(frames, calls), segment| {
+                let pairs = segment.last.saturating_sub(segment.first);
+                (frames + pairs, calls + pairs) // m = 2, so one frame per call
+            });
+        assert!(expected_calls > 0, "the fixture must give the model some work");
+
+        let note = plan
+            .notes
+            .iter()
+            .find(|note| note.contains("will be synthesised"))
+            .unwrap_or_else(|| panic!("the plan must report the model workload: {:?}", plan.notes));
+        assert!(
+            note.contains(&format!("{expected_frames} frame(s)")),
+            "expected {expected_frames} frames in: {note}"
+        );
+        assert!(
+            note.contains(&format!("{expected_calls} call(s)")),
+            "expected {expected_calls} calls in: {note}"
+        );
+
+        // At 2x the two figures must agree: one call produces exactly one frame. They
+        // were 429 and 214.
+        assert_eq!(expected_frames, expected_calls);
+
+        // The specific error, guarded: a segment's emitted count includes the real
+        // frames, and no model produces those.
+        let emitted: u64 = plan
+            .segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::Synthesise)
+            .map(|s| s.emitted())
+            .sum();
+        assert!(
+            expected_frames < emitted,
+            "the synthesised count ({expected_frames}) must be below the emitted count \
+             ({emitted}); the difference is the real frames"
+        );
     }
 
     #[test]
