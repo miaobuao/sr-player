@@ -148,9 +148,16 @@ fn the_engine_runs_the_vulkan_backend_over_a_real_file() {
         caps.interpolate,
         "the backend must advertise interpolation"
     );
+    // This assertion used to be the opposite, and it was right at the time: the
+    // backend could not restore, and a capability report that claimed otherwise
+    // would have had the engine route restoration to a backend that would then
+    // either fail or, worse, answer. It now runs a residual restoration graph on the
+    // device, so the contract changed deliberately — see
+    // `sr-infer-gpu/tests/restore.rs` for what it does with a job.
     assert!(
-        !caps.restore,
-        "this backend does not restore, and the engine must not be told it does"
+        caps.restore,
+        "the backend runs a restoration graph now and must say so, or the engine will \
+         keep Lanczos and never reach it"
     );
     assert!(
         !caps.devices.is_empty(),

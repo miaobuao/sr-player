@@ -1288,15 +1288,19 @@ mod tests {
             Vec::new(),
         );
         assert!(unsupported_on_device(&two_bottom).is_empty());
-        let error = ops_or_skip()
-            .map(|ops| {
-                ops.forward(
-                    &two_bottom,
-                    &gradient(4, 4, 1, 0.1),
-                    &gradient(4, 4, 1, 0.2),
-                )
-            })
-            .unwrap_or(Ok(crate::ifnet::Planar::new(1, 1, 1)))
+        // Skipping rather than substituting a dummy device: the previous version
+        // guessed a `Planar` when there was no adapter and then failed the
+        // assertion, which made this test pass alone and fail in the full suite.
+        // No device means nothing to assert about what the device does.
+        let Some(ops) = ops_or_skip() else {
+            return;
+        };
+        let error = ops
+            .forward(
+                &two_bottom,
+                &gradient(4, 4, 1, 0.1),
+                &gradient(4, 4, 1, 0.2),
+            )
             .expect_err("a two-bottom BinaryOp is not implemented on the device");
         assert!(
             error.to_string().contains("one-bottom BinaryOp"),

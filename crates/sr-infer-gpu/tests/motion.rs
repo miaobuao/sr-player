@@ -373,7 +373,7 @@ fn a_job_through_the_abi_fills_every_output_slot() {
 }
 
 #[test]
-fn the_capability_report_does_not_claim_restoration() {
+fn the_capability_report_matches_what_the_backend_does() {
     // The engine decides what to run from these numbers, so a backend that
     // advertises `SR_OP_RESTORE` and cannot restore is how a pipeline ends up
     // reporting a restoration that never happened.
@@ -408,10 +408,14 @@ fn the_capability_report_does_not_claim_restoration() {
     assert_eq!(code, SR_OK);
     assert_eq!(caps.abi_version, SR_INFER_ABI_VERSION);
     assert!(caps.ops & SR_OP_INTERPOLATE != 0);
-    assert_eq!(
-        caps.ops & SR_OP_RESTORE,
-        0,
-        "restoration is not implemented and must not be advertised"
+    // This used to assert the opposite. It was right then — restoration was not
+    // implemented, and advertising it would have had the engine route restore work
+    // to a backend that could not do it — and it is wrong now, because the backend
+    // runs a residual restoration graph on the device. The change is deliberate;
+    // `tests/restore.rs` is where the new claim is exercised.
+    assert!(
+        caps.ops & SR_OP_RESTORE != 0,
+        "the backend restores now and the report must say so"
     );
     assert_eq!(caps.dtypes, SR_DTYPE_U8);
     assert!(caps.device_count >= 1);

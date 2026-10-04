@@ -41,6 +41,13 @@ use std::io::Write;
 pub struct Session {
     pub device_index: u32,
     pub gpu: Option<GpuSession>,
+    /// The restoration graph and the device it runs on, built on first use.
+    ///
+    /// Lazy because most sessions never restore: a job that only interpolates
+    /// should not pay for a second device and a graph. It records the frame size it
+    /// was built for, because the operators are size-independent but the
+    /// intermediate buffers are not.
+    pub restore: Option<Restore>,
     pub model: String,
     pub calls: u64,
     pub frames_in: u64,
@@ -48,6 +55,58 @@ pub struct Session {
     pub last_error: CString,
     pub width: u32,
     pub height: u32,
+}
+
+/// The restoration path's state: the model, the device, and the size it was built
+/// for.
+pub struct Restore {
+    pub width: u32,
+    pub height: u32,
+    pub model: crate::ifnet::Model,
+    pub ops: crate::ifnet_gpu::GpuOps,
+}
+
+impl Restore {
+    /// Builds the scaffold for a frame size.
+    ///
+    /// The scale is 1. The ABI's `upscale` field describes the backend as a whole,
+    /// and a backend that quietly doubled the picture while the plan also resized
+    /// would scale twice. The topology supports any scale — `residual_sr` takes it
+    /// as a parameter — and advertising one is a later step than running one.
+    pub fn for_size(width: u32, height: u32) -> Result<Self, String> {
+        let ops = crate::ifnet_gpu::GpuOps::open()?;
+        let model = crate::ifnet::residual_sr(width as usize, height as usize, 3, 8, 1, 2);
+        Ok(Restore {
+            width,
+            height,
+            model,
+            ops,
+        })
+    }
+}
+
+/// Interleaved 8-bit RGB to the interleaved float planes the graph speaks.
+pub fn rgb8_to_planar(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> crate::ifnet::Planar {
+    let mut frame = crate::ifnet::Planar::new(width, height, channels);
+    let count = (width * height * channels).min(data.len());
+    for index in 0..count {
+        frame.data[index] = data[index] as f32 / 255.0;
+    }
+    frame
+}
+
+/// Back to interleaved 8-bit RGB, clamped rather than wrapped.
+pub fn planar_to_rgb8(frame: &crate::ifnet::Planar) -> Vec<u8> {
+    frame
+        .data
+        .iter()
+        .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect()
 }
 
 /// Panics must not cross the FFI boundary: unwinding into the engine is undefined
@@ -123,7 +182,7 @@ pub unsafe extern "C" fn sr_infer_query(out: *mut SrInferCaps) -> c_int {
         caps.ops = if devices.is_empty() {
             0
         } else {
-            SR_OP_INTERPOLATE
+            SR_OP_INTERPOLATE | SR_OP_RESTORE
         };
         caps.dtypes = SR_DTYPE_U8;
         caps.flags = SR_CAP_TEMPORAL;
@@ -223,6 +282,7 @@ pub unsafe extern "C" fn sr_infer_open(
         let session = Box::new(Session {
             device_index: requested,
             gpu: Some(gpu),
+            restore: None,
             model,
             calls: 0,
             frames_in: 0,
@@ -344,6 +404,115 @@ pub unsafe extern "C" fn sr_infer_execute(
         if (job.struct_size as usize) < std::mem::size_of::<SrInferJob>() {
             return SR_ERR_INVALID_ARGUMENT;
         }
+        if job.op == SR_OP_RESTORE {
+            // One frame in, one frame out: restoration is a per-frame operation, and
+            // the ABI says so by requiring the counts to match.
+            if job.input_count != job.output_count || job.input_count == 0 {
+                return fail(
+                    session,
+                    SR_ERR_INVALID_ARGUMENT,
+                    format!(
+                        "restoration needs one output per input, got {} in and {} out",
+                        job.input_count, job.output_count
+                    ),
+                );
+            }
+            // SAFETY: the caller guarantees `input_count` / `output_count` images.
+            let inputs = unsafe { std::slice::from_raw_parts(job.inputs, job.input_count as usize) };
+            let outputs =
+                unsafe { std::slice::from_raw_parts_mut(job.outputs, job.output_count as usize) };
+            let width = inputs[0].width;
+            let height = inputs[0].height;
+            let bytes = width as usize * height as usize * 3;
+            for image in inputs.iter() {
+                if image.data.is_null() {
+                    return fail(session, SR_ERR_INVALID_ARGUMENT, "null input buffer".into());
+                }
+                if image.width != width || image.height != height {
+                    return fail(
+                        session,
+                        SR_ERR_INVALID_ARGUMENT,
+                        "every frame in a restoration job must be the same size".into(),
+                    );
+                }
+                if image.dtype != SR_DTYPE_U8
+                    || image.layout != SR_LAYOUT_INTERLEAVED
+                    || image.color != SR_COLOR_RGB
+                {
+                    return fail(
+                        session,
+                        SR_ERR_UNSUPPORTED,
+                        "this backend accepts interleaved 8-bit RGB only".into(),
+                    );
+                }
+            }
+            let ready = matches!(
+                session.restore.as_ref(),
+                Some(restore) if restore.width == width && restore.height == height
+            );
+            if !ready {
+                match Restore::for_size(width, height) {
+                    Ok(restore) => session.restore = Some(restore),
+                    Err(message) => {
+                        return fail(
+                            session,
+                            SR_ERR_RUNTIME,
+                            format!("could not build the restoration graph: {message}"),
+                        )
+                    }
+                }
+            }
+            let Some(restore) = session.restore.as_ref() else {
+                return fail(session, SR_ERR_RUNTIME, "the restoration graph is missing".into());
+            };
+            let mut written = 0u32;
+            for index in 0..job.input_count as usize {
+                // SAFETY: the ABI guarantees `bytes` valid bytes for the call.
+                let source =
+                    unsafe { std::slice::from_raw_parts(inputs[index].data as *const u8, bytes) };
+                let frame = rgb8_to_planar(source, width as usize, height as usize, 3);
+                let restored = match restore.ops.forward(&restore.model, &frame, &frame) {
+                    Ok(restored) => restored,
+                    Err(err) => {
+                        return fail(session, SR_ERR_RUNTIME, format!("restoration failed: {err}"))
+                    }
+                };
+                let data = planar_to_rgb8(&restored);
+                let target = &mut outputs[index];
+                if target.data.is_null() || image_bytes(target) < bytes {
+                    return fail(
+                        session,
+                        SR_ERR_INVALID_ARGUMENT,
+                        format!("output {index} has no room for {bytes} bytes"),
+                    );
+                }
+                // SAFETY: at least `bytes` are writable, checked just above.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), target.data as *mut u8, bytes)
+                };
+                if target.width == 0 {
+                    target.width = width;
+                }
+                if target.height == 0 {
+                    target.height = height;
+                }
+                written += 1;
+            }
+            session.calls += 1;
+            session.frames_in += job.input_count as u64;
+            session.frames_out += written as u64;
+            // The result is filled here rather than after the interpolation loop,
+            // because this path returns before it: a caller that reads
+            // `outputs_written` would otherwise be told nothing was produced.
+            result.outputs_written = written;
+            result.tiles = 1;
+            result.vram_used_bytes = (bytes * (job.input_count as usize + written as usize)) as u64;
+            result.fence = session.calls;
+            result.message = std::ptr::null();
+            log_call(session, job, inputs, written);
+            return SR_OK;
+        }
+
         if job.op != SR_OP_INTERPOLATE {
             return fail(
                 session,
