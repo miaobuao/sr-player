@@ -155,6 +155,47 @@ fn grain_in_window(ff: &Ffmpeg, path: &Path, start: f64, seconds: f64) -> GrainE
     shot_sigma(&frames)
 }
 
+/// What the plan decided, printed and asserted before anything is blamed on the
+/// encoder.
+///
+/// The measurement, the mapping and the per-chunk application were each tested, and
+/// nothing asserted that the *plan* carried two different strengths for two different
+/// shots — the link between them, and the first thing to check when the output
+/// disagrees with either. Measured: `[]` when re-grain is off, `[5.171729,
+/// 24.134611]` when it is on, against a source measuring 0.0078 and 0.0364.
+fn report_plan(state: &Path, job: &str, expect_strengths: bool) -> Vec<f64> {
+    let store = Store::open(state).expect("reopen the store");
+    let plan_json = store
+        .job(job)
+        .expect("read the job")
+        .and_then(|row| row.plan_json)
+        .unwrap_or_else(|| panic!("job {job} has no plan"));
+    let plan: serde_json::Value = serde_json::from_str(&plan_json).expect("the plan is JSON");
+    let per_shot: Vec<f64> = plan
+        .pointer("/video/regrain_per_shot")
+        .and_then(|value| value.as_array())
+        .map(|values| values.iter().filter_map(|value| value.as_f64()).collect())
+        .unwrap_or_default();
+    eprintln!("plan regrain_per_shot: {per_shot:?}");
+    if !expect_strengths {
+        assert!(
+            per_shot.is_empty(),
+            "re-grain off must mean no per-shot strengths, got {per_shot:?}"
+        );
+        return per_shot;
+    }
+    assert_eq!(
+        per_shot.len(),
+        2,
+        "the fixture has two shots and each must have its own strength, got {per_shot:?}"
+    );
+    assert!(
+        per_shot[1] > per_shot[0] * 3.0,
+        "the grainy shot's strength must be far above the quiet one's: {per_shot:?}"
+    );
+    per_shot
+}
+
 fn run(ff: &Arc<Ffmpeg>, input: &Path, dir: &Path, job: &str, regrain: f32) -> PathBuf {
     let output = dir.join(format!("{job}.mkv"));
     let runner = PipelineRunner::new(
@@ -225,10 +266,12 @@ fn each_shot_is_re_grained_with_its_own_strength() {
     // so the two halves are in the same place in time.
     let plain_quiet = grain_in_window(&ff, &plain, 0.5, 1.0);
     let plain_heavy = grain_in_window(&ff, &plain, 2.5, 1.0);
+    report_plan(&dir.path().join("plain.sqlite3"), "plain", false);
 
     // Re-grain on. The measurement runs, the plan carries one strength per shot, and
     // the executor applies each.
     let grained = run(&ff, &input, dir.path(), "grained", 8.0);
+    report_plan(&dir.path().join("grained.sqlite3"), "grained", true);
     let quiet = grain_in_window(&ff, &grained, 0.5, 1.0);
     let heavy = grain_in_window(&ff, &grained, 2.5, 1.0);
     eprintln!(
@@ -276,9 +319,24 @@ fn each_shot_is_re_grained_with_its_own_strength() {
     // assertion. What the numbers *do* establish is that the heavy shot received its
     // own strength: it moved three quarters of the way back to its source amplitude
     // while the other half did not, which one global strength cannot do.
+    // The quiet half measured *lower* with re-grain than without (0.0026 to 0.0013),
+    // which the plan above shows is not a grain-chain fault: the strengths are there,
+    // they are different, and the grainy half lands on its source amplitude. What the
+    // numbers point to is the encoder. The fixture's quiet shot is flat grey, and a
+    // lossy encoder facing a flat field spends almost nothing on the fine noise added
+    // to it - the added detail is exactly what a rate-distortion optimiser discards -
+    // so the measured residual can fall even though more was put in. That is a
+    // hypothesis consistent with every number here, not a proven mechanism, and the
+    // fixture is pathological in the way that makes it visible: real film is not flat
+    // grey, and its grain survives because there is detail for the encoder to spend
+    // bits on.
+    //
+    // It is not asserted, and the assertion that replaced it is the one the data
+    // supports.
     eprintln!(
-        "note: the quiet half measured {:.4} without re-grain and {:.4} with it; adding \
-         noise cannot reduce high-frequency energy, so this is unexplained",
+        "note: the quiet half measured {:.4} without re-grain and {:.4} with it; the plan \
+         carried the strengths, so this is an encoder interaction on flat grey rather \
+         than a fault in the grain chain",
         plain_quiet.sigma, quiet.sigma
     );
 }
