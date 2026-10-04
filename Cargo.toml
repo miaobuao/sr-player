@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sr-core",
+    "crates/sr-cli",
+    "crates/sr-gui",
+    "crates/sr-infer-plugin-example",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Unattended film restoration: portable Rust media engine + GPUI frontend"
+
+[workspace.dependencies]
+# --- internal ---
+sr-core = { path = "crates/sr-core" }
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- errors / logging ---
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- concurrency / state ---
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# --- optional vendor-neutral plugin loading (never required) ---
+libloading = "0.8"
+
+# --- cli ---
+clap = { version = "4", features = ["derive"] }
+
+# --- ui ---
+gpui = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The media engine runs FFmpeg orchestration, DSP and frame analysis; keep even
+# debug builds of dependencies usable.
+[profile.dev.package."*"]
+opt-level = 2

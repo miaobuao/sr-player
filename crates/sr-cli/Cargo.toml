@@ -1,0 +1,17 @@
+[package]
+name = "sr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless driver for the sr-core media engine"
+
+[[bin]]
+name = "sr-cli"
+path = "src/main.rs"
+
+[dependencies]
+sr-core.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

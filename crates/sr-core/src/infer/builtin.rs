@@ -1,0 +1,253 @@
+//! The engines that ship with the application: FFmpeg, and an optional plugin.
+
+use super::abi::{PluginCapabilities, PluginLibrary};
+use super::{Capabilities, EngineKind, EngineStatus, InferenceEngine};
+use crate::ffmpeg::Ffmpeg;
+use std::sync::Arc;
+
+/// Deterministic FFmpeg path: resampling plus frame duplication.
+///
+/// This is the floor the product stands on. It requires no model, no vendor SDK
+/// and no Python, and it cannot hallucinate — at the cost of not inventing detail
+/// that was never in the source.
+pub struct FfmpegEngine {
+    ff: Arc<Ffmpeg>,
+}
+
+impl FfmpegEngine {
+    pub fn new(ff: Arc<Ffmpeg>) -> Self {
+        FfmpegEngine { ff }
+    }
+}
+
+impl InferenceEngine for FfmpegEngine {
+    fn id(&self) -> &str {
+        "ffmpeg-baseline"
+    }
+
+    fn display_name(&self) -> String {
+        format!("FFmpeg baseline ({})", self.ff.version)
+    }
+
+    fn kind(&self) -> EngineKind {
+        EngineKind::Baseline
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        let has_scale = self.ff.has_filter("scale");
+        let has_framerate = self.ff.has_filter("framerate");
+        let mut notes = vec![
+            "scaling is a deterministic Lanczos resample: no invented detail".into(),
+            "interpolation duplicates frames: motion is not synthesised".into(),
+        ];
+        if !has_scale {
+            notes.push("this build has no `scale` filter; scaling is unavailable".into());
+        }
+        if !has_framerate {
+            notes.push("this build has no `framerate` filter; retiming is unavailable".into());
+        }
+        Capabilities {
+            scale: has_scale,
+            interpolate: has_framerate,
+            restore: false,
+            max_pixels: 0,
+            backends: vec!["ffmpeg".into()],
+            precision: vec!["8bit".into(), "10bit".into()],
+            vendor: None,
+            notes,
+        }
+    }
+
+    fn status(&self) -> EngineStatus {
+        if self.ff.has_filter("scale") {
+            EngineStatus::Ready
+        } else {
+            EngineStatus::Unavailable("FFmpeg build lacks the scale filter".into())
+        }
+    }
+
+    fn quality_note(&self) -> String {
+        "no model: cannot invent detail, cannot truly interpolate motion".into()
+    }
+}
+
+/// FFmpeg's motion-compensated interpolator.
+///
+/// Real motion interpolation, no model required — but slow, and it will happily
+/// morph across a cut if it is not told where the cuts are, which is why the plan
+/// only enables it explicitly.
+pub struct MinterpolateEngine {
+    ff: Arc<Ffmpeg>,
+}
+
+impl MinterpolateEngine {
+    pub fn new(ff: Arc<Ffmpeg>) -> Self {
+        MinterpolateEngine { ff }
+    }
+
+    /// Ready-to-use filter arguments for a 2x interpolation of `2x` output.
+    pub fn filter_args(&self) -> String {
+        // `scd=quick` enables scene-change detection inside the filter, and
+        // `mi_mode=mci` is the motion-compensated mode.
+        "minterpolate=fps=0:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10"
+            .to_string()
+    }
+}
+
+impl InferenceEngine for MinterpolateEngine {
+    fn id(&self) -> &str {
+        "ffmpeg-minterpolate"
+    }
+
+    fn display_name(&self) -> String {
+        "FFmpeg minterpolate (motion compensated)".to_string()
+    }
+
+    fn kind(&self) -> EngineKind {
+        EngineKind::Enhanced
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            scale: self.ff.has_filter("scale"),
+            interpolate: self.ff.has_filter("minterpolate"),
+            restore: false,
+            max_pixels: 0,
+            backends: vec!["ffmpeg".into()],
+            precision: vec!["8bit".into(), "10bit".into()],
+            vendor: None,
+            notes: vec![
+                "motion estimation in software: expect a large slowdown on 1080p+".into(),
+                "no generative detail, so no hallucination artefacts".into(),
+            ],
+        }
+    }
+
+    fn status(&self) -> EngineStatus {
+        if self.ff.has_filter("minterpolate") {
+            EngineStatus::Ready
+        } else {
+            EngineStatus::Unavailable("FFmpeg build lacks minterpolate".into())
+        }
+    }
+
+    fn quality_note(&self) -> String {
+        "slower than a model, safer than a model".into()
+    }
+}
+
+/// A loaded inference plugin: the only path that can restore or truly
+/// interpolate with a model, and it is entirely optional.
+pub struct PluginEngine {
+    library: PluginLibrary,
+    capabilities: PluginCapabilities,
+}
+
+impl PluginEngine {
+    pub fn new(library: PluginLibrary, capabilities: PluginCapabilities) -> Self {
+        PluginEngine {
+            library,
+            capabilities,
+        }
+    }
+
+    pub fn library(&self) -> &PluginLibrary {
+        &self.library
+    }
+
+    pub fn capabilities_raw(&self) -> &PluginCapabilities {
+        &self.capabilities
+    }
+}
+
+impl InferenceEngine for PluginEngine {
+    fn id(&self) -> &str {
+        "inference-plugin"
+    }
+
+    fn display_name(&self) -> String {
+        format!("Loaded plugin: {}", self.library.path.display())
+    }
+
+    fn kind(&self) -> EngineKind {
+        EngineKind::Plugin
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            scale: self.capabilities.scale,
+            interpolate: self.capabilities.interpolate,
+            restore: self.capabilities.restore,
+            max_pixels: self.capabilities.max_pixels,
+            backends: if self.capabilities.backend.is_empty() {
+                vec![]
+            } else {
+                vec![self.capabilities.backend.clone()]
+            },
+            precision: if self.capabilities.precision.is_empty() {
+                vec![]
+            } else {
+                vec![self.capabilities.precision.clone()]
+            },
+            vendor: self.capabilities.vendor.clone(),
+            notes: vec![format!(
+                "reports ABI {} capabilities at load time",
+                self.capabilities.abi_version
+            )],
+        }
+    }
+
+    fn status(&self) -> EngineStatus {
+        EngineStatus::Ready
+    }
+
+    fn quality_note(&self) -> String {
+        format!(
+            "model backend {}{}",
+            self.capabilities.backend,
+            self.capabilities
+                .vendor
+                .as_deref()
+                .map(|v| format!(" on {v}"))
+                .unwrap_or_default()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry_without_plugin(ff: Arc<Ffmpeg>) -> super::super::EngineRegistry {
+        // Built directly so the test does not depend on a plugin being present.
+        let mut engines: Vec<Arc<dyn InferenceEngine>> = Vec::new();
+        engines.push(Arc::new(FfmpegEngine::new(Arc::clone(&ff))));
+        super::super::EngineRegistry::from_engines(engines)
+    }
+
+    #[test]
+    fn baseline_engine_is_honest_about_what_it_cannot_do() {
+        let Ok(ff) = Ffmpeg::from_paths("ffmpeg".into(), "ffprobe".into()) else {
+            return;
+        };
+        let ff = Arc::new(ff);
+        let engine = FfmpegEngine::new(Arc::clone(&ff));
+        let caps = engine.capabilities();
+        assert!(caps.scale);
+        assert!(!caps.restore, "the baseline must not claim restoration");
+        assert!(engine.quality_note().contains("cannot invent detail"));
+        assert!(caps.notes.iter().any(|n| n.contains("duplicates frames")));
+    }
+
+    #[test]
+    fn registry_always_has_a_baseline_to_select() {
+        let Ok(ff) = Ffmpeg::from_paths("ffmpeg".into(), "ffprobe".into()) else {
+            return;
+        };
+        let registry = registry_without_plugin(Arc::new(ff));
+        let selected = registry.select(super::super::InferenceTask::Scale);
+        assert!(selected.is_some(), "scaling must always be available");
+        assert_eq!(selected.unwrap().id(), "ffmpeg-baseline");
+        assert!(registry.select(super::super::InferenceTask::Restore).is_none());
+    }
+}

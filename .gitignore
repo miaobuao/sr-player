@@ -1,0 +1,22 @@
+# Rust build output
+/target
+**/*.rs.bk
+*.pdb
+
+# Pipeline scratch space (written next to the output file)
+.sr-scratch/
+/scratch
+/cache
+/.sr-state
+*.log
+
+# Job database
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated test fixtures. `testdata/make_fixture.ps1` recreates all of them:
+# they are megabytes of synthesised video, and the fixture attaches a copy of a
+# system font that must not be redistributed.
+/testdata/*
+!/testdata/make_fixture.ps1

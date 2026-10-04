@@ -1,0 +1,21 @@
+[package]
+name = "sr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vendor-neutral media engine: probing, timeline, decode, analysis, restoration pipeline"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Built only so the ABI integration test has a real shared library to load.
+sr-infer-plugin-example = { path = "../sr-infer-plugin-example" }
