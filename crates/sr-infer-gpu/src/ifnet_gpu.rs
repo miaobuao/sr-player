@@ -224,6 +224,31 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
         output[id.x] = left;
     }
 }
+// Depth to space: `channels * scale^2` planes become `channels` planes at `scale`
+// times the size. The inverse of a sub-pixel convolution, and how a restoration
+// network upsamples without any filtering to get subtly wrong.
+@compute @workgroup_size(64, 1, 1)
+fn depth_to_space(@builtin(global_invocation_id) id: vec3<u32>) {
+    let out_ch = params.out_ch;
+    let count = params.width * params.height * out_ch;
+    if (id.x >= count) {
+        return;
+    }
+    let scale = u32(params.src_width);
+    let per_output = scale * scale;
+    let pixel = id.x / out_ch;
+    let channel = id.x % out_ch;
+    let x = pixel % params.width;
+    let y = pixel / params.width;
+    let source_x = x / scale;
+    let source_y = y / scale;
+    let dx = x % scale;
+    let dy = y % scale;
+    let source_channel = channel * per_output + dy * scale + dx;
+    let source_width = params.width / scale;
+    let source_at = (source_y * source_width + source_x) * (out_ch * per_output) + source_channel;
+    output[id.x] = input[source_at];
+}
 "#;
 
 /// One dispatch's uniform block. The layout must match `Params` in the shader.
@@ -276,6 +301,7 @@ pub struct GpuOps {
     concat: wgpu::ComputePipeline,
     interp: wgpu::ComputePipeline,
     scale: wgpu::ComputePipeline,
+    shuffle: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -329,6 +355,7 @@ impl GpuOps {
         let concat = pipeline("concat");
         let interp = pipeline("interp");
         let scale = pipeline("scale");
+        let shuffle = pipeline("depth_to_space");
         Ok(GpuOps {
             device,
             queue,
@@ -339,6 +366,7 @@ impl GpuOps {
             concat,
             interp,
             scale,
+            shuffle,
         })
     }
 
@@ -651,6 +679,39 @@ impl GpuOps {
                     blobs.insert(top.clone(), output);
                     shapes.insert(top, (width, height, channels));
                 }
+                "DepthToSpace" => {
+                    let (input, (src_width, src_height, in_ch)) = bottom(0)?;
+                    let input = input.clone();
+                    let scale = layer.option(0).unwrap_or(1).max(1) as usize;
+                    if in_ch % (scale * scale) != 0 {
+                        return Err(ModelError::Shape(format!(
+                            "`{}`: {} channels is not a multiple of the {} a scale of {scale} \
+                             needs",
+                            layer.name,
+                            in_ch,
+                            scale * scale
+                        )));
+                    }
+                    let channels = in_ch / (scale * scale);
+                    let (width, height) = (src_width * scale, src_height * scale);
+                    let output = self.empty(width * height * channels);
+                    // `scale` travels in `src_width`, which the shuffle kernel reads
+                    // and nothing else needs at this point in the graph.
+                    let mut params = Params::new(width, height, channels, channels, 1.0);
+                    params.src_width = scale as f32;
+                    let params = self.uniform(params);
+                    self.dispatch_single(
+                        &mut encoder,
+                        &self.shuffle,
+                        "depth_to_space",
+                        &input,
+                        &output,
+                        &params,
+                        width * height * channels,
+                    );
+                    blobs.insert(top.clone(), output);
+                    shapes.insert(top, (width, height, channels));
+                }
                 "Interp" => {
                     let (input, (src_width, src_height, channels)) = bottom(0)?;
                     let input = input.clone();
@@ -889,7 +950,7 @@ pub fn unsupported_on_device(model: &Model) -> Vec<String> {
         .filter(|layer| {
             !matches!(
                 layer.kind.as_str(),
-                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp" | "Interp" | "BinaryOp"
+                "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Warp" | "Interp" | "BinaryOp" | "DepthToSpace"
             )
         })
         .map(|layer| format!("{} ({})", layer.kind, layer.name))
@@ -1012,6 +1073,44 @@ mod tests {
         assert!(
             worst < 1e-4,
             "a pyramid with no flow must be a blend on the device too; worst difference {worst}"
+        );
+    }
+
+    /// The restoration scaffold on the device, with the same invariant the CPU
+    /// reference is held to: an identity upsampler must make the whole network an
+    /// exact nearest-neighbour upscale.
+    ///
+    /// This is the device path for `SR_OP_RESTORE`'s operator set — convolution,
+    /// PReLU, residual addition, and the sub-pixel rearrangement — end to end.
+    #[test]
+    fn a_restoration_scaffold_on_the_device_is_an_exact_nearest_upscale() {
+        let Some(ops) = ops_or_skip() else {
+            return;
+        };
+        let (width, height, channels, scale) = (6, 4, 3, 2);
+        let graph = crate::ifnet::residual_sr(width, height, channels, 4, scale, 2);
+        assert!(
+            unsupported_on_device(&graph).is_empty(),
+            "the device must run the whole restoration graph: {:?}",
+            unsupported_on_device(&graph)
+        );
+        let input = gradient(width, height, channels, 0.3);
+        let gpu = ops.forward(&graph, &input, &input).expect("forward");
+        assert_eq!(
+            (gpu.width, gpu.height, gpu.channels),
+            (width * scale, height * scale, channels)
+        );
+        let expected = crate::ifnet::nearest_upscale(&input, scale);
+        let worst = gpu
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "the device's restoration graph must be a nearest upscale with an \
+             identity upsampler; worst difference {worst}"
         );
     }
 

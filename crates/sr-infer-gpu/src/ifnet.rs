@@ -353,7 +353,7 @@ impl Model {
         self.graph
             .layers
             .iter()
-            .all(|layer| matches!(layer.kind.as_str(), "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp"))
+            .all(|layer| matches!(layer.kind.as_str(), "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp" | "DepthToSpace"))
     }
 }
 
@@ -509,6 +509,195 @@ pub fn pyramid(width: usize, height: usize, channels: usize, features: usize) ->
     }
 }
 
+/// Depth to space: `channels * scale^2` planes become `channels` planes at
+/// `scale` times the size.
+///
+/// This is how a super-resolution network upsamples. It is not an interpolation —
+/// no filtering, no half-pixel offset to get wrong — which is exactly why it is the
+/// operator worth having: the learned part lives entirely in the convolution that
+/// produces the extra planes, and the rearrangement afterwards must be beyond
+/// suspicion.
+///
+/// The layout matches PyTorch's `pixel_shuffle`: input channel
+/// `c * scale^2 + (dy * scale + dx)` becomes output pixel `(x * scale + dx,
+/// y * scale + dy)` of output channel `c`.
+pub fn depth_to_space(input: &Planar, scale: usize) -> Result<Planar, ModelError> {
+    if scale == 0 {
+        return Err(ModelError::Shape("a scale of zero is not a resize".into()));
+    }
+    let per_output = scale * scale;
+    if input.channels == 0 || input.channels % per_output != 0 {
+        return Err(ModelError::Shape(format!(
+            "depth_to_space with scale {scale} needs a multiple of {per_output} channels, got {}",
+            input.channels
+        )));
+    }
+    let channels = input.channels / per_output;
+    let (width, height) = (input.width * scale, input.height * scale);
+    let mut output = Planar::new(width, height, channels);
+    for y in 0..height {
+        for x in 0..width {
+            let source_x = x / scale;
+            let source_y = y / scale;
+            let dx = x % scale;
+            let dy = y % scale;
+            for channel in 0..channels {
+                let source_channel = channel * per_output + dy * scale + dx;
+                output.set(channel, x, y, input.at(source_channel, source_x, source_y));
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// The nearest-neighbour upscale a super-resolution network must reduce to when its
+/// residual branch says nothing.
+pub fn nearest_upscale(input: &Planar, scale: usize) -> Planar {
+    let mut output = Planar::new(input.width * scale, input.height * scale, input.channels);
+    for y in 0..output.height {
+        for x in 0..output.width {
+            for channel in 0..input.channels {
+                output.set(channel, x, y, input.at(channel, x / scale, y / scale));
+            }
+        }
+    }
+    output
+}
+
+/// Builds a residual super-resolution network: a feature stem, residual blocks, a
+/// long skip, and a depth-to-space upsampler.
+///
+/// The topology is emitted rather than written as text, and each layer's weights are
+/// appended as it is built, so the offsets cannot drift from the layer list — the
+/// same discipline [`pyramid`] uses.
+///
+/// Every weight is zero except the final convolution, which copies the input's
+/// channels into the low `scale^2` slots of the upsampler's input. That makes the
+/// network an exact nearest-neighbour upscale, which is a property a wrong channel
+/// ordering or a transposed depth-to-space destroys. A real checkpoint would replace
+/// all of it: with these weights this is a scaffold, not a restorer.
+pub fn residual_sr(
+    width: usize,
+    height: usize,
+    channels: usize,
+    features: usize,
+    scale: usize,
+    blocks: usize,
+) -> Model {
+    let _ = (width, height);
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut weights: Vec<f32> = Vec::new();
+    let mut push = |layer: Layer| layers.push(layer);
+
+    let conv = |name: &str,
+                from: &str,
+                to: &str,
+                out_ch: usize,
+                in_ch: usize,
+                weights: &mut Vec<f32>| {
+        let mut options = HashMap::new();
+        options.insert(0u32, out_ch as i32);
+        options.insert(1u32, 3);
+        options.insert(7u32, in_ch as i32);
+        weights.extend(std::iter::repeat(0.0).take(out_ch * in_ch * 9 + out_ch));
+        Layer::new("Convolution", name, vec![from.into()], vec![to.into()], options)
+    };
+    let prelu = |name: &str, from: &str, to: &str, ch: usize, weights: &mut Vec<f32>| {
+        let mut options = HashMap::new();
+        options.insert(0u32, ch as i32);
+        weights.extend(std::iter::repeat(0.0).take(ch));
+        Layer::new("PReLU", name, vec![from.into()], vec![to.into()], options)
+    };
+    let add = |name: &str, first: &str, second: &str, to: &str| {
+        Layer::new(
+            "Add",
+            name,
+            vec![first.into(), second.into()],
+            vec![to.into()],
+            HashMap::new(),
+        )
+    };
+
+    push(Layer::new(
+        "Input",
+        "input",
+        Vec::new(),
+        vec!["frame".into()],
+        HashMap::new(),
+    ));
+    let stem_at = weights.len();
+    push(conv("stem", "frame", "stem", features, channels, &mut weights));
+    push(prelu("stem_act", "stem", "features", features, &mut weights));
+    // The stem copies each input channel into a feature channel. Without this the
+    // scaffold is not an identity at all: every residual weight is zero, so the body
+    // would be zero and the upsampler would rearrange nothing into nothing. In a
+    // trained network these taps are learned; here they are the one place the picture
+    // enters the graph.
+    let stem_per_out = channels * 9;
+    for channel in 0..channels.min(features) {
+        weights[stem_at + channel * stem_per_out + channel * 9 + 4] = 1.0;
+    }
+
+    let mut last = "features".to_string();
+    for block in 0..blocks.max(1) {
+        let inner = format!("block{block}_conv");
+        let acted = format!("block{block}_act");
+        let raw = format!("block{block}_raw");
+        let out = format!("block{block}_out");
+        push(conv(&inner, &last, &inner, features, features, &mut weights));
+        push(prelu(&acted, &inner, &acted, features, &mut weights));
+        push(conv(&out, &acted, &raw, features, features, &mut weights));
+        push(add(&format!("block{block}_residual"), &last, &raw, &out));
+        last = out;
+    }
+
+    push(conv("tail", &last, "tail", features, features, &mut weights));
+    push(add("long_skip", &last, "tail", "body"));
+
+    let upsampler_at = weights.len();
+    push(conv(
+        "upsample",
+        "body",
+        "sub_pixels",
+        channels * scale * scale,
+        features,
+        &mut weights,
+    ));
+    let mut options = HashMap::new();
+    options.insert(0u32, scale as i32);
+    push(Layer::new(
+        "DepthToSpace",
+        "shuffle",
+        vec!["sub_pixels".into()],
+        vec!["out".into()],
+        options,
+    ));
+
+    // The identity that makes the scaffold exact: output channel `c` of the
+    // upsampler reads input channel `c` at the centre tap, and the other
+    // `scale^2 - 1` slots stay zero, so depth-to-space reproduces each input pixel
+    // `scale` times.
+    // Every sub-pixel slot of an output channel reads that channel of the body, so
+    // the rearrangement reproduces each input pixel `scale` times. Filling only the
+    // first slot would put the picture in the top-left of every block and zeros
+    // everywhere else, which is what this test caught the first time.
+    let per_out = features * 9;
+    for channel in 0..channels {
+        for slot in 0..scale * scale {
+            let out_channel = channel * scale * scale + slot;
+            weights[upsampler_at + out_channel * per_out + channel * 9 + 4] = 1.0;
+        }
+    }
+
+    Model {
+        graph: Graph {
+            layers,
+            weight_count: weights.len(),
+        },
+        weights,
+    }
+}
+
 impl Model {
     /// The layers this module cannot run, so a caller can say which.
     pub fn unsupported(&self) -> Vec<String> {
@@ -519,7 +708,7 @@ impl Model {
             .filter(|layer| {
                 !matches!(
                     layer.kind.as_str(),
-                    "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp"
+                    "Input" | "Split" | "Concat" | "Add" | "PReLU" | "Convolution" | "Interp" | "Warp" | "BinaryOp" | "DepthToSpace"
                 )
             })
             .map(|layer| format!("{} ({})", layer.kind, layer.name))
@@ -715,6 +904,11 @@ impl Model {
                     // midpoint is halfway, which is the convention RIFE uses.
                     let divisor = layer.option(0).map(|value| value as f32).unwrap_or(2.0);
                     blobs.insert(top, warp_by_flow(input, flow, divisor));
+                }
+                "DepthToSpace" => {
+                    let input = bottom(0)?;
+                    let scale = layer.option(0).unwrap_or(1).max(1) as usize;
+                    blobs.insert(top, depth_to_space(input, scale)?);
                 }
                 other => {
                     return Err(ModelError::Shape(format!(
@@ -1366,6 +1560,92 @@ mod tests {
         let output = model.forward(&input, &input).expect("forward");
         assert!((output.at(0, 0, 0) - 3.0).abs() < 1e-6);
         assert!((output.at(1, 1, 1) + 1.5).abs() < 1e-6);
+    }
+
+    /// The depth-to-space layout, checked by hand on a case small enough to read.
+    ///
+    /// Four planes of a single pixel become one plane of four pixels, and the order
+    /// is the whole content of the operator: `c * scale^2 + dy * scale + dx` becomes
+    /// `(x * scale + dx, y * scale + dy)`.
+    #[test]
+    fn depth_to_space_rearranges_the_way_pixel_shuffle_does() {
+        let mut input = Planar::new(1, 1, 4);
+        for channel in 0..4 {
+            input.set(channel, 0, 0, channel as f32 + 1.0);
+        }
+        let output = depth_to_space(&input, 2).expect("shuffle");
+        assert_eq!((output.width, output.height, output.channels), (2, 2, 1));
+        // Channel 0 -> top left, 1 -> top right, 2 -> bottom left, 3 -> bottom right.
+        assert_eq!(output.at(0, 0, 0), 1.0);
+        assert_eq!(output.at(0, 1, 0), 2.0);
+        assert_eq!(output.at(0, 0, 1), 3.0);
+        assert_eq!(output.at(0, 1, 1), 4.0);
+
+        // A scale that does not divide the channel count is refused rather than
+        // silently dropping planes.
+        let three = Planar::new(2, 2, 3);
+        assert!(depth_to_space(&three, 2).is_err());
+        assert!(depth_to_space(&three, 0).is_err());
+    }
+
+    /// The restoration scaffold must reduce to an exact nearest-neighbour upscale.
+    ///
+    /// Every weight is zero except the upsampler's identity taps, so the whole
+    /// network — stem, residual blocks, long skip, sub-pixel convolution and the
+    /// rearrangement — has to collapse to "each input pixel repeated `scale` times".
+    /// A transposed depth-to-space, a mis-ordered channel, or an `Add` that reads the
+    /// wrong operand all show up as a difference.
+    #[test]
+    fn a_restoration_scaffold_is_an_exact_nearest_upscale() {
+        let (width, height, channels, scale) = (6, 4, 3, 2);
+        let model = residual_sr(width, height, channels, 4, scale, 2);
+        assert!(model.is_runnable(), "unsupported: {:?}", model.unsupported());
+        assert_eq!(
+            model.graph.layers.last().map(|layer| layer.kind.as_str()),
+            Some("DepthToSpace"),
+            "the upsampler ends the graph"
+        );
+        let input = gradient(width, height, channels, 0.3);
+        let output = model.forward(&input, &input).expect("forward");
+        assert_eq!(
+            (output.width, output.height, output.channels),
+            (width * scale, height * scale, channels)
+        );
+        let expected = nearest_upscale(&input, scale);
+        let worst = output
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "a scaffold with an identity upsampler must be a nearest upscale; worst \
+             difference {worst}"
+        );
+    }
+
+    /// The scaffold survives the checkpoint format like the pyramid does, which is
+    /// what a real restoration checkpoint would arrive in.
+    #[test]
+    fn a_restoration_scaffold_round_trips_through_a_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sr.param");
+        let original = residual_sr(8, 6, 3, 4, 2, 1);
+        original.write_checkpoint(&path).expect("write");
+        let loaded = Model::load(&path).expect("load");
+        assert_eq!(loaded.graph.layers, original.graph.layers);
+        assert_eq!(loaded.weights.len(), original.weights.len());
+        let input = gradient(8, 6, 3, 0.4);
+        let a = original.forward(&input, &input).expect("forward");
+        let b = loaded.forward(&input, &input).expect("forward");
+        let worst = a
+            .data
+            .iter()
+            .zip(b.data.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(worst, 0.0, "the round trip must be exact");
     }
 
     fn gradient(width: usize, height: usize, channels: usize, base: f32) -> Planar {
