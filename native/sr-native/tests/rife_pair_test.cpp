@@ -222,6 +222,35 @@ int main(int argc, char** argv)
     check(sr_rife_process(rife, &image, &image, 1.0f, &image) == SR_ERR_INVALID_ARGUMENT,
           "timestep 1 is refused");
 
+    // A constant image. Warping a constant returns that constant for *any* flow, so
+    // this case is insensitive to the flow field entirely: if the output is not
+    // constant, the fault is in the warp or the readback rather than in the flow.
+    {
+        std::vector<unsigned char> flat((size_t)kW * kH * 3, 128);
+        sr_image ia = image;
+        ia.data = flat.data();
+        sr_image ib = ia;
+        std::vector<unsigned char> mid(flat.size(), 0);
+        sr_image im = ia;
+        im.data = mid.data();
+        const int rc = sr_rife_process(rife, &ia, &ib, 0.5f, &im);
+        if (rc != SR_OK)
+        {
+            printf("  FAIL  constant pair returned %d\n", rc);
+            failures++;
+        }
+        else
+        {
+            unsigned char lo = 255, hi = 0;
+            double sum = 0;
+            for (unsigned char v : mid) { if (v < lo) lo = v; if (v > hi) hi = v; sum += v; }
+            printf("  constant 128 pair: output min %u max %u mean %.2f\n",
+                   lo, hi, sum / (double)mid.size());
+            check(hi - lo <= 2,
+                  "warping a constant image gives a constant image");
+        }
+    }
+
     // The unambiguous case: two identical frames describe no motion at all, so
     // the midpoint is that same frame. Any working interpolator returns it to
     // within a rounding error, and a broken one cannot accidentally pass.
