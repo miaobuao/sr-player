@@ -36,11 +36,18 @@
 //! enhanced raw (last two seconds): [3.0e27, 3.5e18, 7.3e17, 3.6e24, 3.9e27, 7.9e23]
 //! ```
 //!
-//! So the track is correct for ten seconds and contains values of order `1e27` in
-//! its last two. Every reader agrees on that — the library's own `PcmBuffer::read_wav`
-//! and FFmpeg's decoder both report it — which is the point: the disagreement I spent
-//! two rounds on was between a reader and a *truncated look at a scan*, not between
-//! two readers.
+//! The tail is now measured completely — every 100 ms block from 9.0 s to the end —
+//! and **every block is clean**, peaks of 0.5, no garbage anywhere, in a file the
+//! library reader reports as 3,456,036 samples of 12.000 s at 48 kHz across six
+//! channels. So the file is not corrupt, and the `1e27` the two readers report for
+//! its last two seconds is not in it.
+//!
+//! That leaves a contradiction *inside this test*, and it is worth stating exactly:
+//! `wav_channel_levels` reads through `PcmBuffer::read_wav`, the same reader the block
+//! scan uses, on the same path, in the same run — and returns `1e27` while the scan
+//! returns 0.5. Whatever that is, it is not a property of the file and not a
+//! disagreement between readers. It is something about how this test reads it, and it
+//! has now cost three rounds, which is more than it deserves.
 //!
 //! What is still unexplained is why the pipeline's own `ebur128` pass over the same
 //! file reports -19.0 LUFS and -20.8 dBTP. That is the remaining question, and it is
@@ -406,24 +413,25 @@ fn a_five_one_mix_gets_a_centre_lift_and_an_untouched_lfe() {
              first frame {first:?}",
             bytes.len()
         );
-        // Where does it first go wrong? Second by second, channel 0, so the answer
-        // is a timestamp rather than "somewhere in twelve seconds".
-        let data = &bytes[44..];
-        let samples: &[f32] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
-        };
-        let per_second = 48_000 * 6;
-        for second in 0..(samples.len() / per_second).min(12) {
-            let from = second * per_second;
-            let to = from + per_second;
-            let peak = samples[from..to]
-                .iter()
-                .fold(0.0f32, |acc, value| acc.max(value.abs()));
-            let centre = samples[from + 2..to]
-                .iter()
-                .step_by(6)
-                .fold(0.0f32, |acc, value| acc.max(value.abs()));
-            eprintln!("  t={second}s peak {peak:.6e} (centre {centre:.6e})");
+        // Where does it first go wrong? Every 100 ms block across the last three
+        // seconds, printed in full. The previous version printed a line per second and
+        // I read its first ten as the whole story twice; this one is bounded to a
+        // region small enough to read completely, and it states the file's length and
+        // duration beside it so a truncated view cannot look complete.
+        let buffer = sr_core::audio::pcm::PcmBuffer::read_wav(&enhanced).expect("parse it");
+        let block = 4_800 * 6;
+        let total = buffer.samples.len();
+        eprintln!(
+            "enhanced: {} samples = {:.3}s at {} Hz, {} ch; blocks from 9.0s:",
+            total,
+            total as f64 / (buffer.sample_rate as f64 * buffer.channels as f64),
+            buffer.sample_rate,
+            buffer.channels
+        );
+        let from = (9.0 * buffer.sample_rate as f64) as usize * buffer.channels as usize;
+        for (index, chunk) in buffer.samples[from.min(total)..].chunks(block).enumerate() {
+            let peak = chunk.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+            eprintln!("  t={:.1}s peak {peak:.6e}", 9.0 + index as f64 * 0.1);
         }
     }
     let source = channel_levels(&ff, &fixture.path, 6);
