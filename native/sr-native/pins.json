@@ -1,0 +1,135 @@
+{
+  "_comment": [
+    "Every artifact sr-native links against or loads, pinned.",
+    "",
+    "The rule this file exists to enforce: nothing floats. ncnn is pinned by tag AND",
+    "by commit AND by the SHA256 of the archive it was taken from, because a runtime",
+    "that changes underneath a release is not a runtime anyone can test against.",
+    "Model weights are never committed — they are downloaded and hash-checked.",
+    "",
+    "`pwsh -File setup-third-party.ps1` rebuilds third_party/ and models/ from this",
+    "file. All hashes below were computed on the RTX 5070 Ti reference machine."
+  ],
+
+  "ncnn": {
+    "repository": "https://github.com/Tencent/ncnn",
+    "tag": "20260526",
+    "commit": "e54f7b1f88434e1d844ea0551b880a1cfb079ce1",
+    "artifact": "ncnn-20260526-windows-vs2022.zip",
+    "artifact_bytes": 70623601,
+    "artifact_sha256": "5ed388b134c50ba8eb2e6605f3a16f692f26598d45113bc9794aa4857d691e26",
+    "license": "BSD-3-Clause",
+    "why_not_20250503": [
+      "The RIFE models were exported against 20250503 — the commit the VapourSynth RIFE",
+      "fork's subprojects/ncnn resolves to — so that version was tested first, and it is",
+      "recorded here so nobody repeats it. ncnn 20250503 cannot submit to Vulkan on this",
+      "machine at all:",
+      "    vkQueueSubmit failed -4 / vkWaitForFences failed -4   (VK_ERROR_DEVICE_LOST)",
+      "on the very first call, against an RTX 5070 Ti on driver 617.14. On the CPU it",
+      "produces the same result as 20260526, so it is not a semantics difference either.",
+      "It is not a usable pin on the reference machine."
+    ],
+    "tools": {
+      "ncnnoptimize": "converts the published fp16 weights to fp32 using ncnn's own reader"
+    }
+  },
+
+  "vulkan_loader": {
+    "_comment": [
+      "ncnn's Vulkan build needs a vulkan-1 import library. The Vulkan SDK supplies one,",
+      "along with glslangValidator; installing it needs elevation, which the reference",
+      "machine does not grant, so the import library is generated from the system loader",
+      "DLL instead. ncnn's release bundles glslang, so no shader compiler is needed."
+    ],
+    "source": "%SystemRoot%\\System32\\vulkan-1.dll",
+    "exported_symbols": 265,
+    "generated": "third_party/vulkan/vulkan-1.lib"
+  },
+
+  "models": {
+    "_comment": [
+      "Downloaded, never committed: .gitignore excludes models/. The published RIFE",
+      "weights are stored as fp16 and ncnn reads fp16 natively; the copy this runtime",
+      "loads is ncnnoptimize's fp32 conversion, whose hash is recorded separately."
+    ],
+    "rife-4.25": {
+      "role": "the sole production interpolator (ensemble = false)",
+      "repository": "https://github.com/styler00dollar/VapourSynth-RIFE-ncnn-Vulkan",
+      "repo_path": "models/rife-v4.25_ensembleFalse",
+      "published": {
+        "flownet.param": { "git_blob_sha": "7e8b02281edd17f0548b54898163dc7231368c8f" },
+        "flownet.bin": {
+          "git_blob_sha": "3ad486b3346d78096b75b7d4409c4862a69a6be4",
+          "bytes": 11360684,
+          "sha256": "10de487a095e61cb2971c39e3b5e17005a70fba6201c77fb96e063f4423b583f",
+          "storage": "fp16, 5,680,342 words"
+        }
+      },
+      "installed": {
+        "_comment": "what sr_rife_create loads: ncnnoptimize's fp32 output, plus its rewritten param",
+        "flownet.param": {
+          "bytes": 29038,
+          "sha256": "a59a3d1852e6a3b136ffb4106710afa627f86d58f5a9a13e7792c11080bfba38"
+        },
+        "flownet.bin": {
+          "bytes": 22683820,
+          "sha256": "4bb0c36177e870a49cf903878011c05b3afe7e09f3d126da34f8d76d2350b1e8",
+          "storage": "fp32"
+        }
+      },
+      "conversion": "ncnnoptimize <published param> <published bin> flownet.param flownet.bin 0",
+      "known_defect": [
+        "The published artifact contains 288 fp16 words with exponent 31 (NaN/Inf).",
+        "This was verified against the published blob SHA, so the defect is in the",
+        "artifact rather than in the download or the conversion. Zeroing exactly those",
+        "words does not change the output by a measurable amount, so they are NOT the",
+        "cause of rife_pair_test failing; the artifact is kept byte-faithful."
+      ],
+      "license": "MIT"
+    },
+    "rife-4.6": {
+      "role": "control — a second model, from a different repository, used to separate this harness from the 4.25 artifact",
+      "repository": "https://github.com/nihui/rife-ncnn-vulkan",
+      "repo_path": "models/rife-v4.6",
+      "installed": {
+        "flownet.param": { "git_blob_sha": "3cb69d4ae09b" },
+        "flownet.bin": { "git_blob_sha": "70de38ecc5b6", "bytes": 10610000 }
+      },
+      "storage": "fp16",
+      "license": "MIT",
+      "result": "fails identically in this harness — which is what cleared the 4.25 artifact as the cause"
+    },
+    "realesrgan-x4plus": {
+      "role": "the first production restoration model",
+      "repository": "https://github.com/xinntao/Real-ESRGAN",
+      "release": "v0.2.5.0",
+      "artifact": "realesrgan-ncnn-vulkan-20220424-windows.zip",
+      "path_in_artifact": "models/realesrgan-x4plus.{param,bin}",
+      "installed_as": ["model.param", "model.bin"],
+      "installed": {
+        "model.param": {
+          "bytes": 116029,
+          "sha256": "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86"
+        },
+        "model.bin": {
+          "bytes": 33424520,
+          "sha256": "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf"
+        }
+      },
+      "scale": 4,
+      "license": "MIT",
+      "verified": "restore_image_test passes: luminance preserved, output differs from a bilinear upscale by 30.28 levels, tiled and untiled agree to 5.16 levels"
+    }
+  },
+
+  "reference_hardware": {
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "vulkan_device_index": 0,
+    "vendor_id": "0x10de",
+    "device_id": "0x2c05",
+    "driver": "617.14",
+    "heap_budget_mib": 15227,
+    "second_device": "AMD Radeon(TM) Graphics — integrated, unified memory, never eligible to host a model",
+    "toolchain": "Visual Studio 18 Community, MSVC 14.51.36231, CMake and Ninja from the same install"
+  }
+}

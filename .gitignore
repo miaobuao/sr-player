@@ -27,3 +27,11 @@
 # Downloaded model checkpoints: large, licensed by their authors, never redistributed.
 /.sr-models/
 /models/
+
+# sr-native build output and the third-party binaries it links against.
+# `third_party/ncnn` (45 MB of prebuilt libraries) and `vulkan-1.lib` are
+# produced by native/sr-native/setup-third-party.ps1 from pins recorded in
+# native/sr-native/pins.json; regenerating them is cheaper than versioning them.
+/native/sr-native/build/
+/native/sr-native/third_party/ncnn/
+/native/sr-native/third_party/vulkan/

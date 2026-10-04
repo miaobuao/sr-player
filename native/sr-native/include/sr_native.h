@@ -94,8 +94,8 @@ enum {
     SR_DEVICE_CPU = 4
 };
 
-typedef struct sr_device_info {
-    /* Set this to sizeof(sr_device_info) before the call. */
+typedef struct sr_device_info_t {
+    /* Set this to sizeof(sr_device_info_t) before the call. */
     uint32_t struct_size;
     int32_t  index;
 
@@ -117,7 +117,7 @@ typedef struct sr_device_info {
     uint64_t budget_mib;
     /* Non-zero when device-local memory is system RAM shared with the OS. */
     int32_t  unified_memory;
-} sr_device_info;
+} sr_device_info_t;
 
 /* How many Vulkan devices the runtime can see. 0 means it cannot run. */
 int sr_device_count(void);
@@ -125,8 +125,13 @@ int sr_device_count(void);
 /*
  * Fills `out` for device `index`. Returns SR_ERR_NO_DEVICE if there is no such
  * device, SR_ERR_INVALID_ARGUMENT if `struct_size` is wrong.
+ *
+ * The struct carries the `_t` suffix and the function does not, which is not
+ * decoration: C++ has one identifier namespace for both, so a struct named
+ * `sr_device_info` alongside a function of that name cannot be compiled as C++ at
+ * all — `sr_device_info info;` parses as a call.
  */
-int sr_device_info(int32_t index, sr_device_info* out);
+int sr_device_info(int32_t index, sr_device_info_t* out);
 
 /* ------------------------------------------------------------------ context */
 
