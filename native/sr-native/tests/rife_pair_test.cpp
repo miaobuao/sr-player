@@ -179,6 +179,16 @@ bool run_case(sr_rife* rife,
 
 } // namespace
 
+// Which Vulkan device to run on. Defaults to 0; `SR_DEVICE=1` reaches the second
+// one, which is how the same tests are run against another vendor's driver without
+// a second machine.
+static int sr_test_device()
+{
+    const char* value = getenv("SR_DEVICE");
+    if (!value || !*value)
+        return 0;
+    return atoi(value);
+}
 int main(int argc, char** argv)
 {
     printf("sr-native rife_pair_test\n");
@@ -191,7 +201,7 @@ int main(int argc, char** argv)
     }
     printf("  model: %s\n", dir);
 
-    sr_context* ctx = sr_context_create(0);
+    sr_context* ctx = sr_context_create(sr_test_device());
     if (!ctx)
     {
         printf("  FAIL  no Vulkan context\n");

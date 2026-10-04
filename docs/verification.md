@@ -230,6 +230,48 @@ verdict that the model is wrong. It is a statement that:
 Settling which of those is right needs the AI visual QC in the completion bar. The
 numbers above are a specification for it, not a substitute.
 
+## Vendor independence, partial evidence
+
+The objective says vendor independence counts only once the same build and the same
+model artifacts complete the regression suite on representative AMD and Intel Vulkan
+GPUs without vendor-specific application code. This machine has an **AMD Radeon(TM)
+Graphics** integrated device, so two of those three conditions could be tested and
+one could not.
+
+**No vendor-specific code in the model path.** `vendor_id` is reported and never
+branched on (`runtime.cpp:114`, `ai/mod.rs:201`). The vendor-specific code that does
+exist is in `gpu.rs` and is `nvidia-smi` / `rocm-smi` telemetry sourcing for the UI,
+which does not gate execution. The binary tested below is the same binary in both
+columns; only `SR_DEVICE` changed.
+
+| check | NVIDIA RTX 5070 Ti (0) | AMD Radeon integrated (1) |
+|---|---|---|
+| `device_test` | PASSED | PASSED |
+| `restore_image_test` | PASSED, 30.28 levels from bilinear | PASSED, **30.16** |
+| `rife_pair_test` | PASSED | PASSED |
+| identical frames | 0.002 levels | **0.013** |
+| 2 px shift, t = 0.50 | 0.303 | **0.357** |
+| 8 px shift, t = 0.50 | 0.974 | **0.987** |
+| 4 px shift, t = 0.25 | 1.125 | **1.121** |
+
+Two vendors' Vulkan drivers, the same model weights, the same custom `Warp` layer,
+and results agreeing to within a few hundredths of a level. That is what "no
+vendor-specific code" should look like when it is true.
+
+**What this does not establish, and should not be read as establishing:**
+
+* the AMD device is **integrated**, sharing system memory. It is not a
+  representative discrete AMD GPU, and `preferred_device()` refuses it for real work
+  precisely because its 30746 MiB "budget" is not memory this process can count on;
+* **no Intel GPU was tested at all**;
+* the runs are the four native gates, not the CLI regression suite, so the Rust
+  side of the boundary was not exercised on AMD;
+* this was made possible by adding an `SR_DEVICE` override to the three native
+  tests, which defaults to 0 and changes nothing about the default runs.
+
+So the honest position is: the architecture has been shown to be vendor-neutral
+across two vendors' drivers on one machine, which is a real result and not the
+verification the objective asks for. The clause remains **unverified**.
 ## Defects found by doing the work above
 
 ### Fixed: a stored plan outlived the options that shaped it
