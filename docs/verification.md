@@ -73,19 +73,31 @@ comparing consecutive frames distinguishes the two.
 The plan states the cut guarantee in its own words: *"2 cut(s) in this file are
 shot boundaries the interpolation is never allowed to cross"*.
 
-## Open defects
+## Defects found by doing the work above
 
-Neither is fixed. Both were found by doing the work above.
+### Fixed: a stored plan outlived the options that shaped it
 
-1. **A stored plan is replayed when the job identity matches, even if the options
-   have changed.** The identity is a hash of the input and output paths, so
-   changing `--interpolate` while keeping the same output path silently reuses the
-   old plan. This cost real time: every dry run reported `off` because the first,
-   pre-fix run had persisted its plan. `--no-resume` or a fresh output path works
-   around it. The fix is either to fold the plan-shaping options into the identity
-   or to detect the mismatch and say so rather than obey it.
+The job identity was a hash of the input and output paths. Stage results — and
+**the plan is a stage result** — are committed to the store and restored on a
+resumed run, so changing an option and re-running the same output path silently
+restored the plan built for the old options. `--interpolate rife` reported `off`,
+and went on reporting `off`, because the first run under that output path had
+committed a plan with interpolation disabled. That is how a correct implementation
+looked broken for two rounds.
 
-2. **The pre-run estimate is wrong.** `429 frame(s) will be synthesised` and
-   `214 call(s)` against an actual 239 intermediates. The output is correct, so it
-   is the planner's estimate rather than the executor's arithmetic — but a figure
-   that overstates the work by 80% is one nobody will trust.
+The explanation first written here — a cached `plan_json` column — was wrong.
+`plan_json` is written and never read; the real mechanism is `load_or`'s stage
+results. Worth recording because the wrong explanation was plausible enough to
+have been left standing.
+
+The options are now part of the identity, hashed alongside the paths. The cost is
+that changing an option starts a new job and discards committed chunks, which is
+the right trade: a chunk built under different settings is not a valid answer to
+the new question.
+
+### Open: the pre-run estimate is 80% wrong
+
+`429 frame(s) will be synthesised` and `214 call(s)` against an actual 239
+intermediates. The output is correct, so it is the planner's estimate rather than
+the executor's arithmetic — but a figure that overstates the work by that much is
+one nobody will trust.

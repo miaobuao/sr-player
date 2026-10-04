@@ -355,7 +355,17 @@ fn run(cli: &Cli) -> sr_core::Result<ExitCode> {
             let bus = EventBus::new();
             attach_printer(&bus, cli.verbose);
 
-            let job_id = new_job_id(input, &output);
+                        let job_id = new_job_id(
+                input,
+                &output,
+                &plan_fingerprint(
+                    &profile,
+                    chunk_encoding.as_deref(),
+                    *regrain,
+                    *quality,
+                    *no_audio,
+                ),
+            );
             let scratch = output
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -445,10 +455,45 @@ fn default_output_path(input: &Path) -> PathBuf {
 ///   artifacts built from a different film. Nothing validated that a chunk row
 ///   belonged to the input being processed.
 ///
+/// Everything a user can change that changes the plan, rendered deterministically.
+///
+/// The profile is serialised rather than formatted by hand so that a field added
+/// later is included automatically — a fingerprint with a hole in it is worse than
+/// no fingerprint, because it looks like it works.
+fn plan_fingerprint(
+    profile: &RestorationProfile,
+    chunk_encoding: Option<&str>,
+    regrain: Option<f32>,
+    quality: Option<i32>,
+    no_audio: bool,
+) -> String {
+    let extra = format!(
+        "chunk_encoding={chunk_encoding:?};regrain={regrain:?};quality={quality:?};no_audio={no_audio}"
+    );
+    match serde_json::to_string(profile) {
+        Ok(json) => format!("{json}\u{1}{extra}"),
+        Err(_) => format!("{profile:?}\u{1}{extra}"),
+    }
+}
+
 /// Hashing the input and output paths fixes both: the same conversion resumes, and
 /// two different conversions cannot collide. FNV-1a rather than `DefaultHasher`,
 /// because a job id has to mean the same thing in a later release.
-fn new_job_id(input: &Path, output: &Path) -> String {
+///
+/// **The options are part of the identity too.** Stage results are committed to the
+/// store and restored on a resumed run, and one of those stages is the plan. Keying
+/// on the paths alone meant that changing an option and re-running the same output
+/// path silently restored the plan built for the *old* options: a
+/// `--interpolate rife` run reported `off`, and kept reporting `off`, because the
+/// first run under that output path had committed a plan with interpolation
+/// disabled. The same hazard applies to every other option that shapes the plan,
+/// so all of them are hashed.
+///
+/// The cost is that changing an option starts a new job and discards committed
+/// chunks. That is the correct trade: a chunk built under different settings is not
+/// a valid answer to the new question, and reusing it silently would be worse than
+/// redoing it.
+fn new_job_id(input: &Path, output: &Path, options: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
         for byte in bytes {
@@ -459,6 +504,8 @@ fn new_job_id(input: &Path, output: &Path) -> String {
     feed(input.to_string_lossy().as_bytes());
     feed(&[0]);
     feed(output.to_string_lossy().as_bytes());
+    feed(&[0]);
+    feed(options.as_bytes());
 
     // The stem as well, so `sr-cli jobs` and the logs show which film a row belongs
     // to without a lookup.
@@ -485,8 +532,8 @@ mod tests {
     /// a second attempt resume instead of starting over.
     #[test]
     fn a_job_id_is_the_same_for_the_same_conversion() {
-        let one = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
-        let two = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
+        let one = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"), "opts");
+        let two = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"), "opts");
         assert_eq!(one, two, "the same conversion must resume, not restart");
         assert!(one.starts_with("cli-a-"), "the id should name the film: {one}");
     }
@@ -495,13 +542,40 @@ mod tests {
     /// second — which is what a batch loop does, and what the old
     /// `cli-<seconds>` scheme could not tell apart.
     #[test]
+    /// The property that was missing, and the reason `--interpolate rife` reported
+    /// `off` for two rounds: the plan is a committed stage result, so a job id that
+    /// ignores the options restores the plan built for the old ones.
+    #[test]
+    fn changing_an_option_is_a_different_job() {
+        let off = new_job_id(
+            Path::new("E:/films/a.mkv"),
+            Path::new("E:/out/a.mkv"),
+            "method=off;multiplier=1",
+        );
+        let rife = new_job_id(
+            Path::new("E:/films/a.mkv"),
+            Path::new("E:/out/a.mkv"),
+            "method=rife;multiplier=2",
+        );
+        assert_ne!(off, rife, "a different option set must not reuse an old plan");
+
+        // The same options must still resume, or this fix has traded one bug for
+        // the one the identity was introduced to solve in the first place.
+        let again = new_job_id(
+            Path::new("E:/films/a.mkv"),
+            Path::new("E:/out/a.mkv"),
+            "method=rife;multiplier=2",
+        );
+        assert_eq!(rife, again, "the same conversion must still resume");
+    }
+
     fn different_conversions_get_different_ids() {
-        let first = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"));
-        let second = new_job_id(Path::new("E:/films/b.mkv"), Path::new("E:/out/b.mkv"));
+        let first = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a.mkv"), "opts");
+        let second = new_job_id(Path::new("E:/films/b.mkv"), Path::new("E:/out/b.mkv"), "opts");
         assert_ne!(first, second);
         // The same input to a different output is different work as well: the chunks
         // are the same but the film being built is not.
-        let third = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a-1080.mkv"));
+        let third = new_job_id(Path::new("E:/films/a.mkv"), Path::new("E:/out/a-1080.mkv"), "opts");
         assert_ne!(first, third);
     }
 }
