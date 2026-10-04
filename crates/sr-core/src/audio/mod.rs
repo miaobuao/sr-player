@@ -78,20 +78,28 @@ pub fn remaster_to_wav(
     let mut reader = PcmReader::open(ff, manifest.path.as_path(), &decode, reporter, cancel)?;
     reader.channels = channels;
     let mut writer = WavWriter::create(out_path, rate, channels)?;
+    let layout = manifest
+        .audio
+        .get(stream_index)
+        .and_then(|stream| stream.channel_layout.clone());
     let mut processor = if analysis.decision.apply {
         let curve = GainCurve::from_track(&analysis.track, &analysis.decision, settings);
+        let processor = RemasterProcessor::new(curve, channels, rate, settings, layout.as_deref());
+        // What is done to *which* channel is part of the result, not an
+        // implementation detail: a dialogue gain applied to the whole mix is a
+        // different (and wrong) operation that happens to share its name.
         reporter.info(
             Some(Stage::AudioProcess),
-            format!(
-                "applying dialogue rider:{}",
-                if curve.max_gain_db() > 0.0 {
-                    format!(" up to {:+.1} dB", curve.max_gain_db())
-                } else {
-                    String::new()
-                }
-            ),
+            format!("dialogue rider: {}", processor.channel_plan().describe()),
         );
-        Some(RemasterProcessor::new(curve, channels, rate, settings))
+        if processor.channel_plan().is_inert() {
+            reporter.warn(
+                Some(Stage::AudioProcess),
+                "no centre channel was identified, so the dialogue rider is leaving the mix \
+                 alone rather than lifting every channel and calling it a dialogue boost",
+            );
+        }
+        Some(processor)
     } else {
         None
     };

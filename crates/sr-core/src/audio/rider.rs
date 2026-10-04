@@ -267,6 +267,245 @@ impl GainCurve {
     }
 }
 
+/// What a channel is for, and therefore what may be done to it.
+///
+/// The dialogue rider used to multiply the gain into *every* channel and then
+/// duck the masking band on the surrounds. That is not a dialogue boost: it is a
+/// whole-mix boost that happens to coincide with speech, and it scaled the LFE
+/// along with everything else, which changes the low end of the mix and can clip
+/// a subwoofer for reasons that have nothing to do with dialogue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRole {
+    /// Carries the dialogue. Gets the rider gain; never the masking duck, because
+    /// ducking the band we just lifted is undoing the work.
+    Dialogue,
+    /// Screen channels. No gain; masking band ducked.
+    Front,
+    /// Surround channels. No gain; masking band ducked.
+    Surround,
+    /// The low-frequency effects channel. Untouched, always.
+    LowFrequency,
+    /// Not identified. Untouched: applying a dialogue gain to a channel we cannot
+    /// name is guessing, and the guess is audible.
+    Unknown,
+}
+
+/// How a channel layout is processed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiderStrategy {
+    /// One channel carries everything: boost it, duck nothing (ducking the only
+    /// channel would thin the dialogue we just lifted).
+    Mono,
+    /// Mid/side: the dialogue is what the two channels share, so the gain goes to
+    /// the mid signal and the masking band is ducked in the side signal.
+    StereoMidSide,
+    /// A centre channel carries the dialogue; the masking band is ducked in the
+    /// screen and surround channels.
+    CentreChannel,
+    /// The layout could not be identified. Nothing is applied, and the reason is
+    /// reported.
+    LeaveAlone,
+}
+
+/// Which channels are which, for one stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelPlan {
+    pub roles: Vec<ChannelRole>,
+    pub strategy: RiderStrategy,
+    pub note: String,
+}
+
+impl ChannelPlan {
+    /// Maps a channel count and FFmpeg's layout name onto roles.
+    ///
+    /// FFmpeg's canonical order is `FL FR FC LFE BL BR [SL SR]`, so most of this
+    /// is index arithmetic; the layout name is only needed where the count alone
+    /// is ambiguous (three channels is `2.1` or `3.0`, four is `quad` or `3.1`).
+    /// Anything not recognised is left alone rather than guessed at.
+    pub fn for_stream(channels: u16, layout: Option<&str>) -> ChannelPlan {
+        let name = layout.unwrap_or("").to_ascii_lowercase();
+        let has = |needle: &str| name.contains(needle);
+        let role = |roles: &[ChannelRole]| ChannelPlan {
+            roles: roles.to_vec(),
+            strategy: if roles.contains(&ChannelRole::Dialogue) {
+                RiderStrategy::CentreChannel
+            } else {
+                RiderStrategy::LeaveAlone
+            },
+            note: String::new(),
+        };
+        let (plan, note) = match channels {
+            0 => (RiderStrategy::LeaveAlone, "no channels".to_string()),
+            1 => (
+                RiderStrategy::Mono,
+                "mono: the single channel is the dialogue".to_string(),
+            ),
+            2 => (
+                RiderStrategy::StereoMidSide,
+                "stereo: dialogue is the shared (mid) signal, so the gain goes there and the \
+                 masking band is ducked in the side signal"
+                    .to_string(),
+            ),
+            3 if has("2.1") => (
+                RiderStrategy::LeaveAlone,
+                "2.1 has no centre channel, so there is no dialogue channel to lift".to_string(),
+            ),
+            3 => (
+                RiderStrategy::CentreChannel,
+                "3.0: centre carries the dialogue".to_string(),
+            ),
+            4 if has("3.1") || has("lfe") => (
+                RiderStrategy::CentreChannel,
+                "3.1: centre carries the dialogue, LFE is left alone".to_string(),
+            ),
+            4 => (
+                RiderStrategy::LeaveAlone,
+                format!(
+                    "4-channel layout `{}` has no centre channel",
+                    if name.is_empty() { "unknown" } else { &name }
+                ),
+            ),
+            5 if has("4.1") => (
+                RiderStrategy::CentreChannel,
+                "4.1: centre carries the dialogue".to_string(),
+            ),
+            5 => (
+                RiderStrategy::CentreChannel,
+                "5.0: centre carries the dialogue, surrounds are ducked".to_string(),
+            ),
+            6 if has("5.1") || has("lfe") || name.is_empty() => (
+                RiderStrategy::CentreChannel,
+                "5.1: dialogue gain on the centre, masking band ducked on the screen and \
+                 surround channels, LFE untouched"
+                    .to_string(),
+            ),
+            6 => (
+                RiderStrategy::LeaveAlone,
+                format!("6-channel layout `{name}` is not one this build recognises"),
+            ),
+            7 if has("6.1") => (
+                RiderStrategy::CentreChannel,
+                "6.1: centre carries the dialogue".to_string(),
+            ),
+            7 => (
+                RiderStrategy::LeaveAlone,
+                format!("7-channel layout `{name}` is not one this build recognises"),
+            ),
+            8 if has("7.1") || name.is_empty() => (
+                RiderStrategy::CentreChannel,
+                "7.1: dialogue gain on the centre, masking band ducked on the screen and \
+                 surround channels, LFE untouched"
+                    .to_string(),
+            ),
+            _ => (
+                RiderStrategy::LeaveAlone,
+                format!("{channels}-channel layout `{name}` is not one this build recognises"),
+            ),
+        };
+
+        let mut plan = match plan {
+            RiderStrategy::Mono => role(&[ChannelRole::Dialogue]),
+            RiderStrategy::StereoMidSide => role(&[ChannelRole::Front, ChannelRole::Front]),
+            RiderStrategy::CentreChannel => match channels {
+                3 => role(&[ChannelRole::Front, ChannelRole::Front, ChannelRole::Dialogue]),
+                4 => role(&[
+                    ChannelRole::Front,
+                    ChannelRole::Front,
+                    ChannelRole::Dialogue,
+                    ChannelRole::LowFrequency,
+                ]),
+                5 => role(&[
+                    ChannelRole::Front,
+                    ChannelRole::Front,
+                    ChannelRole::Dialogue,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                ]),
+                6 => role(&[
+                    ChannelRole::Front,
+                    ChannelRole::Front,
+                    ChannelRole::Dialogue,
+                    ChannelRole::LowFrequency,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                ]),
+                7 => role(&[
+                    ChannelRole::Front,
+                    ChannelRole::Front,
+                    ChannelRole::Dialogue,
+                    ChannelRole::LowFrequency,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                ]),
+                _ => role(&[
+                    ChannelRole::Front,
+                    ChannelRole::Front,
+                    ChannelRole::Dialogue,
+                    ChannelRole::LowFrequency,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                    ChannelRole::Surround,
+                ]),
+            },
+            RiderStrategy::LeaveAlone => ChannelPlan {
+                roles: vec![ChannelRole::Unknown; channels as usize],
+                strategy: RiderStrategy::LeaveAlone,
+                note: String::new(),
+            },
+        };
+        plan.strategy = if channels == 1 {
+            RiderStrategy::Mono
+        } else if channels == 2 {
+            RiderStrategy::StereoMidSide
+        } else {
+            plan.strategy
+        };
+        plan.note = note;
+        plan
+    }
+
+    pub fn strategy_name(&self) -> &'static str {
+        match self.strategy {
+            RiderStrategy::Mono => "mono",
+            RiderStrategy::StereoMidSide => "mid/side",
+            RiderStrategy::CentreChannel => "centre-channel",
+            RiderStrategy::LeaveAlone => "untouched",
+        }
+    }
+
+    /// True when this plan cannot do anything useful.
+    pub fn is_inert(&self) -> bool {
+        self.strategy == RiderStrategy::LeaveAlone
+    }
+
+    /// One line for the log: what happens to which channel.
+    pub fn describe(&self) -> String {
+        let roles: Vec<String> = self
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                format!(
+                    "{}:{}",
+                    index,
+                    match role {
+                        ChannelRole::Dialogue => "dialogue",
+                        ChannelRole::Front => "front",
+                        ChannelRole::Surround => "surround",
+                        ChannelRole::LowFrequency => "lfe",
+                        ChannelRole::Unknown => "?",
+                    }
+                )
+            })
+            .collect();
+        format!("{} [{}] — {}", self.strategy_name(), roles.join(" "), self.note)
+    }
+}
+
 /// Applies a [`GainCurve`] to interleaved PCM, in place, block by block.
 pub struct RemasterProcessor {
     curve: GainCurve,
@@ -274,11 +513,13 @@ pub struct RemasterProcessor {
     chunk_frames: usize,
     chunk_index: usize,
     frame_in_chunk: usize,
-    /// Channels whose 300 Hz–6 kHz band is ducked. Surrounds only on 5.1+, so
-    /// the front stage keeps its tonal balance.
-    duck_channels: Vec<bool>,
-    splitters: Vec<ThreeBandSplitter>,
+    plan: ChannelPlan,
+    /// One splitter per channel that gets the masking-band duck.
+    splitters: Vec<Option<ThreeBandSplitter>>,
+    /// The side signal of a stereo pair, and the split of it.
+    side_splitter: ThreeBandSplitter,
     scratch_channel: Vec<f32>,
+    scratch_side: Vec<f32>,
     scratch_low: Vec<f32>,
     scratch_mid: Vec<f32>,
     scratch_high: Vec<f32>,
@@ -287,34 +528,59 @@ pub struct RemasterProcessor {
 }
 
 impl RemasterProcessor {
-    pub fn new(curve: GainCurve, channels: u16, rate: u32, settings: &RiderSettings) -> Self {
+    /// Builds a processor for a stream, deciding per channel what may be touched.
+    pub fn new(
+        curve: GainCurve,
+        channels: u16,
+        rate: u32,
+        settings: &RiderSettings,
+        layout: Option<&str>,
+    ) -> Self {
         let channels = channels.max(1) as usize;
-        // Stereo (and mono): duck the band on every channel. Multichannel: ducks
-        // the surrounds, leaving centre/front untouched.
-        let duck_channels = if channels <= 2 {
-            vec![true; channels]
-        } else {
-            (0..channels).map(|c| c >= 4).collect()
+        let plan = ChannelPlan::for_stream(channels as u16, layout);
+        let needs_duck = |role: ChannelRole| {
+            matches!(role, ChannelRole::Front | ChannelRole::Surround)
         };
+        let splitters = plan
+            .roles
+            .iter()
+            .map(|role| {
+                needs_duck(*role).then(|| {
+                    ThreeBandSplitter::new(
+                        rate,
+                        settings.duck_band_low_hz,
+                        settings.duck_band_high_hz,
+                    )
+                })
+            })
+            .collect();
         let chunk_frames =
             ((rate as f64 * curve.chunk_ms.max(1) as f64 / 1000.0).round() as usize).max(1);
         RemasterProcessor {
-            splitters: (0..channels)
-                .map(|_| ThreeBandSplitter::new(rate, settings.duck_band_low_hz, settings.duck_band_high_hz))
-                .collect(),
+            splitters,
+            side_splitter: ThreeBandSplitter::new(
+                rate,
+                settings.duck_band_low_hz,
+                settings.duck_band_high_hz,
+            ),
             curve,
             channels,
             chunk_frames,
             chunk_index: 0,
             frame_in_chunk: 0,
-            duck_channels,
+            plan,
             scratch_channel: Vec::new(),
+            scratch_side: Vec::new(),
             scratch_low: Vec::new(),
             scratch_mid: Vec::new(),
             scratch_high: Vec::new(),
             frames_processed: 0,
             peak_gain_linear: 1.0,
         }
+    }
+
+    pub fn channel_plan(&self) -> &ChannelPlan {
+        &self.plan
     }
 
     pub fn frames_processed(&self) -> u64 {
@@ -336,6 +602,85 @@ impl RemasterProcessor {
         if ch == 0 || data.is_empty() {
             return;
         }
+        match self.plan.strategy {
+            RiderStrategy::LeaveAlone => {
+                // Count the frames so the curve stays in step, and change nothing.
+                self.advance(data.len() / ch);
+            }
+            RiderStrategy::StereoMidSide if ch == 2 => self.process_stereo(data),
+            _ => self.process_roles(data),
+        }
+    }
+
+    /// Moves the chunk cursor forward by `frames`.
+    fn advance(&mut self, frames: usize) {
+        self.frames_processed += frames as u64;
+        self.frame_in_chunk += frames;
+        while self.frame_in_chunk >= self.chunk_frames {
+            self.frame_in_chunk -= self.chunk_frames;
+            self.chunk_index += 1;
+        }
+    }
+
+    /// Mid/side: the dialogue is the shared signal, so the gain goes to the mid
+    /// and the masking band is ducked in the side.
+    fn process_stereo(&mut self, data: &mut [f32]) {
+        let mut side = std::mem::take(&mut self.scratch_side);
+        let mut low = std::mem::take(&mut self.scratch_low);
+        let mut mid_band = std::mem::take(&mut self.scratch_mid);
+        let mut high = std::mem::take(&mut self.scratch_high);
+        let mut mid = std::mem::take(&mut self.scratch_channel);
+
+        let mut position = 0usize;
+        while position < data.len() {
+            let frames_available = (data.len() - position) / 2;
+            if frames_available == 0 {
+                break;
+            }
+            let frames = (self.chunk_frames - self.frame_in_chunk).min(frames_available);
+            let gain = self.curve.gain_linear(self.chunk_index);
+            let duck = self.curve.duck_linear(self.chunk_index);
+            self.peak_gain_linear = self.peak_gain_linear.max(gain);
+
+            mid.clear();
+            side.clear();
+            for frame in 0..frames {
+                let left = data[position + frame * 2];
+                let right = data[position + frame * 2 + 1];
+                mid.push((left + right) * 0.5 * gain);
+                side.push((left - right) * 0.5);
+            }
+            if duck < 0.999 {
+                // Subtracting the attenuated band keeps the result exactly unity
+                // when nothing is ducked, and leaves whatever the crossover did
+                // not identify as mid-band alone.
+                self.side_splitter
+                    .split(&side, &mut low, &mut mid_band, &mut high);
+                let reduction = 1.0 - duck;
+                for index in 0..frames {
+                    side[index] -= mid_band[index] * reduction;
+                }
+            }
+            for frame in 0..frames {
+                data[position + frame * 2] = mid[frame] + side[frame];
+                data[position + frame * 2 + 1] = mid[frame] - side[frame];
+            }
+
+            position += frames * 2;
+            self.advance(frames);
+        }
+
+        self.scratch_side = side;
+        self.scratch_low = low;
+        self.scratch_mid = mid_band;
+        self.scratch_high = high;
+        self.scratch_channel = mid;
+    }
+
+    /// One role per channel: dialogue is lifted, screens and surrounds are ducked,
+    /// everything else is left alone.
+    fn process_roles(&mut self, data: &mut [f32]) {
+        let ch = self.channels;
         let mut splitters = std::mem::take(&mut self.splitters);
         let mut channel_buf = std::mem::take(&mut self.scratch_channel);
         let mut low = std::mem::take(&mut self.scratch_low);
@@ -354,19 +699,36 @@ impl RemasterProcessor {
             self.peak_gain_linear = self.peak_gain_linear.max(gain);
 
             for channel in 0..ch {
+                let role = self
+                    .plan
+                    .roles
+                    .get(channel)
+                    .copied()
+                    .unwrap_or(ChannelRole::Unknown);
+                let channel_gain = if role == ChannelRole::Dialogue {
+                    gain
+                } else {
+                    1.0
+                };
+                let channel_duck = if matches!(role, ChannelRole::Front | ChannelRole::Surround) {
+                    duck
+                } else {
+                    1.0
+                };
+
                 channel_buf.clear();
                 channel_buf.extend(
-                    (0..frames).map(|frame| data[position + frame * ch + channel] * gain),
+                    (0..frames)
+                        .map(|frame| data[position + frame * ch + channel] * channel_gain),
                 );
 
-                if self.duck_channels.get(channel).copied().unwrap_or(false) && duck < 0.999 {
-                    // Subtract the attenuated band instead of resumming: the
-                    // result is exact unity when nothing is ducked, and anything
-                    // the crossover did not identify as mid-band stays untouched.
-                    splitters[channel].split(&channel_buf, &mut low, &mut mid, &mut high);
-                    let reduction = 1.0 - duck;
-                    for index in 0..frames {
-                        channel_buf[index] -= mid[index] * reduction;
+                if channel_duck < 0.999 {
+                    if let Some(splitter) = splitters.get_mut(channel).and_then(Option::as_mut) {
+                        splitter.split(&channel_buf, &mut low, &mut mid, &mut high);
+                        let reduction = 1.0 - channel_duck;
+                        for index in 0..frames {
+                            channel_buf[index] -= mid[index] * reduction;
+                        }
                     }
                 }
 
@@ -376,12 +738,7 @@ impl RemasterProcessor {
             }
 
             position += frames * ch;
-            self.frames_processed += frames as u64;
-            self.frame_in_chunk += frames;
-            if self.frame_in_chunk >= self.chunk_frames {
-                self.frame_in_chunk = 0;
-                self.chunk_index += 1;
-            }
+            self.advance(frames);
         }
 
         self.splitters = splitters;
@@ -545,7 +902,7 @@ mod tests {
         let decision = decision_for(-17.0, Some(-29.0), 1.0);
         let curve = GainCurve::from_track(&track, &decision, &settings);
         let rate = 48_000u32;
-        let mut processor = RemasterProcessor::new(curve, 1, rate, &settings);
+        let mut processor = RemasterProcessor::new(curve, 1, rate, &settings, Some("mono"));
 
         // Five seconds of a constant tone; 10 ms chunks put speech (chunks
         // 50..150) at samples 24_000..72_000. 100 Hz sits *below* the ducked
@@ -584,13 +941,12 @@ mod tests {
         assert_eq!(processor.frames_processed(), total as u64);
     }
 
-    #[test]
-    fn processor_ducks_the_mid_band_on_a_stereo_mix() {
-        let settings = RiderSettings::default();
+    /// A curve whose envelope has settled on the decision's gain and duck.
+    fn settled_curve(settings: &RiderSettings, chunks: usize) -> GainCurve {
         let track = DialogueTrack {
             chunk_ms: 10,
-            levels_db: vec![-20.0; 100],
-            mask: vec![true; 100],
+            levels_db: vec![-20.0; chunks],
+            mask: vec![true; chunks],
             threshold_db: -40.0,
             noise_floor_db: -50.0,
             speech_ratio: 1.0,
@@ -599,36 +955,217 @@ mod tests {
             notes: vec![],
         };
         let decision = decision_for(-17.0, Some(-29.0), 1.0);
-        let curve = GainCurve::from_track(&track, &decision, &settings);
-        let rate = 48_000u32;
-        let mut processor = RemasterProcessor::new(curve, 2, rate, &settings);
+        GainCurve::from_track(&track, &decision, settings)
+    }
 
-        // A 1 kHz tone sits inside the ducked band; a 60 Hz tone does not.
-        let frames = 48_000;
-        let mut interleaved = Vec::with_capacity(frames * 2);
-        for i in 0..frames {
-            let t = i as f64 / rate as f64;
-            let mid = 0.2 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
-            let low = 0.2 * (2.0 * std::f64::consts::PI * 60.0 * t).sin() as f32;
-            interleaved.push(mid);
-            interleaved.push(low);
+    /// Mean absolute level of one channel over a settled window.
+    fn channel_level(data: &[f32], channels: usize, channel: usize, from: usize, to: usize) -> f32 {
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+        for frame in from..to {
+            sum += data[frame * channels + channel].abs();
+            count += 1;
         }
-        let before_mid = interleaved[40_000];
-        let before_low = interleaved[40_001];
-        processor.process_block(&mut interleaved);
-        let after_mid = interleaved[40_000];
-        let after_low = interleaved[40_001];
-        // Gain rises over the first chunks, so compare the tail where it has settled.
-        let tail_mid: f32 = interleaved[80_000..90_000].iter().step_by(2).map(|s| s.abs()).sum();
-        let tail_low: f32 = interleaved[80_001..90_000].iter().step_by(2).map(|s| s.abs()).sum();
-        assert!(tail_mid.is_finite() && tail_low.is_finite());
-        let _ = (before_mid, before_low, after_mid, after_low);
-        // The low band keeps more energy than the ducked mid band once the duck
-        // has settled (4 dB of duck plus the +5 dB rider gain on both).
+        sum / count.max(1) as f32
+    }
+
+    /// Mean absolute value of a unit-amplitude sine, so expectations can be
+    /// expressed against the input rather than against a magic number.
+    const SINE_MEAN: f32 = 0.6366;
+
+    #[test]
+    fn a_centre_channel_mix_gets_a_dialogue_boost_not_a_whole_mix_boost() {
+        // The complaint this fixes: the rider multiplied the gain into *every*
+        // channel, so what was described as a dialogue boost was a boost of the
+        // entire mix that happened to coincide with speech — LFE included.
+        let settings = RiderSettings::default();
+        let curve = settled_curve(&settings, 100);
+        let gain = curve.gain_linear(80);
+        let duck = curve.duck_linear(80);
+        assert!(gain > 1.05 && duck < 0.98, "the fixture must actually act");
+
+        let rate = 48_000u32;
+        let frames = 48_000usize;
+        let mut processor = RemasterProcessor::new(curve, 6, rate, &settings, Some("5.1(side)"));
+        let plan = processor.channel_plan().clone();
+        assert_eq!(plan.strategy, RiderStrategy::CentreChannel);
+        assert_eq!(plan.roles[2], ChannelRole::Dialogue);
+        assert_eq!(plan.roles[3], ChannelRole::LowFrequency);
+        assert_eq!(plan.roles[0], ChannelRole::Front);
+        assert_eq!(plan.roles[5], ChannelRole::Surround);
+
+        // A 1 kHz tone in every channel: inside the ducked band, and the same
+        // starting level everywhere, so the measurements are about what was done
+        // to each channel rather than about what was in it.
+        let mut data = vec![0.0f32; frames * 6];
+        for frame in 0..frames {
+            let t = frame as f64 / rate as f64;
+            let value = 0.2 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+            for channel in 0..6 {
+                data[frame * 6 + channel] = value;
+            }
+        }
+        let original = data.clone();
+        processor.process_block(&mut data);
+
+        let before = 0.2 * SINE_MEAN;
+        let centre = channel_level(&data, 6, 2, 40_000, 48_000);
+        let front_left = channel_level(&data, 6, 0, 40_000, 48_000);
+        let surround = channel_level(&data, 6, 4, 40_000, 48_000);
+        let lfe = channel_level(&data, 6, 3, 40_000, 48_000);
+
         assert!(
-            tail_low > tail_mid * 1.4,
-            "low band should survive the mid-band duck: low {tail_low} vs mid {tail_mid}"
+            centre > before * 1.2,
+            "the centre channel carries the dialogue and must be lifted: {before} -> {centre}"
         );
+        assert!(
+            front_left < before * 0.95,
+            "a screen channel must not be lifted with the dialogue: {before} -> {front_left}"
+        );
+        assert!(
+            front_left > before * duck * 0.8,
+            "the screen channel should be ducked by roughly the requested {duck:.2}, not muted: \
+             {front_left}"
+        );
+        assert!(
+            surround < before * 0.95,
+            "a surround channel must not be lifted either: {before} -> {surround}"
+        );
+        assert!(
+            (lfe - before).abs() < before * 0.02,
+            "the LFE channel must be untouched: {before} -> {lfe}"
+        );
+        let lfe_changed = (0..frames * 6)
+            .filter(|index| index % 6 == 3)
+            .any(|index| data[index] != original[index]);
+        assert!(
+            !lfe_changed,
+            "the LFE channel was modified; nothing about dialogue may change the low end"
+        );
+    }
+
+    #[test]
+    fn a_stereo_mix_gets_the_gain_on_the_mid_and_the_duck_on_the_side() {
+        let settings = RiderSettings::default();
+        let rate = 48_000u32;
+        let frames = 48_000usize;
+        let before = 0.2 * SINE_MEAN;
+
+        // (a) A centred tone is entirely mid: it gets the gain, and the duck —
+        //     which acts on the side signal — does not touch it.
+        let curve = settled_curve(&settings, 100);
+        let gain = curve.gain_linear(80);
+        let mut processor = RemasterProcessor::new(curve, 2, rate, &settings, Some("stereo"));
+        assert_eq!(
+            processor.channel_plan().strategy,
+            RiderStrategy::StereoMidSide
+        );
+        let mut centred = vec![0.0f32; frames * 2];
+        for frame in 0..frames {
+            let t = frame as f64 / rate as f64;
+            let value = 0.2 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+            centred[frame * 2] = value;
+            centred[frame * 2 + 1] = value;
+        }
+        processor.process_block(&mut centred);
+        let after = channel_level(&centred, 2, 0, 40_000, 48_000);
+        assert!(
+            after > before * 1.2,
+            "a centred (dialogue) tone must be lifted: {before} -> {after} (gain {gain:.3})"
+        );
+        assert!(
+            after < before * gain * 1.2,
+            "and not lifted beyond what the curve asked for"
+        );
+
+        // (b) An out-of-phase tone is entirely side: no gain, and its masking
+        //     band is ducked.
+        let curve = settled_curve(&settings, 100);
+        let duck = curve.duck_linear(80);
+        let mut processor = RemasterProcessor::new(curve, 2, rate, &settings, Some("stereo"));
+        let mut out_of_phase = vec![0.0f32; frames * 2];
+        for frame in 0..frames {
+            let t = frame as f64 / rate as f64;
+            let value = 0.2 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+            out_of_phase[frame * 2] = value;
+            out_of_phase[frame * 2 + 1] = -value;
+        }
+        processor.process_block(&mut out_of_phase);
+        let after = channel_level(&out_of_phase, 2, 0, 40_000, 48_000);
+        assert!(
+            after < before * 0.95,
+            "an out-of-phase (side) tone must be ducked, not lifted: {before} -> {after} \
+             (duck {duck:.3})"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_layout_is_left_alone_rather_than_guessed_at() {
+        let settings = RiderSettings::default();
+        let rate = 48_000u32;
+        let frames = 24_000usize;
+        let curve = settled_curve(&settings, 100);
+        // Four channels with no centre: FFmpeg's "quad", or something this build
+        // has never seen. Either way there is no dialogue channel to lift, and
+        // lifting all four is exactly the behaviour being fixed.
+        let mut processor = RemasterProcessor::new(curve, 4, rate, &settings, Some("quad"));
+        let plan = processor.channel_plan().clone();
+        assert_eq!(plan.strategy, RiderStrategy::LeaveAlone);
+        assert!(
+            plan.note.contains("no centre channel"),
+            "the reason must be reportable: {}",
+            plan.note
+        );
+
+        let mut data: Vec<f32> = (0..frames * 4)
+            .map(|index| 0.2 * ((index % 97) as f32 / 97.0 - 0.5))
+            .collect();
+        let original = data.clone();
+        processor.process_block(&mut data);
+        assert_eq!(
+            data, original,
+            "an unidentified layout must pass through untouched"
+        );
+        assert_eq!(processor.frames_processed(), frames as u64);
+    }
+
+    #[test]
+    fn the_channel_plan_maps_the_layouts_that_actually_occur() {
+        let mono = ChannelPlan::for_stream(1, Some("mono"));
+        assert_eq!(mono.strategy, RiderStrategy::Mono);
+        assert_eq!(mono.roles, vec![ChannelRole::Dialogue]);
+
+        assert_eq!(
+            ChannelPlan::for_stream(2, Some("stereo")).strategy,
+            RiderStrategy::StereoMidSide
+        );
+
+        for (name, channels) in [("5.1", 6), ("5.1(side)", 6), ("7.1", 8), ("7.1(wide)", 8)] {
+            let plan = ChannelPlan::for_stream(channels, Some(name));
+            assert_eq!(
+                plan.strategy,
+                RiderStrategy::CentreChannel,
+                "{name} must be handled"
+            );
+            assert_eq!(plan.roles[2], ChannelRole::Dialogue, "{name} centre");
+            assert_eq!(plan.roles[3], ChannelRole::LowFrequency, "{name} lfe");
+        }
+
+        // 2.1 is FL FR LFE: no centre channel to lift.
+        let two_one = ChannelPlan::for_stream(3, Some("2.1"));
+        assert_eq!(two_one.strategy, RiderStrategy::LeaveAlone);
+        assert!(two_one.is_inert());
+
+        // 3.0 is FL FR FC.
+        assert_eq!(
+            ChannelPlan::for_stream(3, Some("3.0")).roles[2],
+            ChannelRole::Dialogue
+        );
+
+        // An unknown name is reported, not guessed at.
+        let odd = ChannelPlan::for_stream(6, Some("hexagonal"));
+        assert_eq!(odd.strategy, RiderStrategy::LeaveAlone);
+        assert!(odd.note.contains("hexagonal"), "{}", odd.note);
     }
 
     #[test]
