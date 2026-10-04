@@ -125,6 +125,46 @@ The first step was adopted on a measurement that turned out to be noise (see bel
 the second on a 33% wall-clock reduction, with no quality claim attached, because the
 proxy that would have supported one is not valid.
 
+## The runtime dependency claim, verified
+
+The completion bar says the released program must run with no Python, CUDA
+Toolkit/runtime, TensorRT, PyTorch or ONNX Runtime installed — only a working
+Vulkan-capable NVIDIA driver. That is a claim about a binary, so it was checked
+against one rather than asserted.
+
+**What it imports** (`dumpbin /nologo /dependents target\release\sr-cli.exe`):
+
+```
+kernel32.dll  ntdll.dll  bcryptprimitives.dll
+api-ms-win-core-synch-l1-2-0.dll  api-ms-win-crt-*.dll
+MSVCP140.dll  VCOMP140.DLL  VCRUNTIME140.dll  VCRUNTIME140_1.dll
+```
+
+Windows system libraries and the MSVC runtime. Nothing else.
+
+**What it loads at runtime**, sampled from a live conversion in progress:
+
+```
+49 modules loaded while Vulkan was live
+vulkan-1.dll loaded: True
+cuda / nvcuda / cudart / nvrtc:            none
+tensorrt / onnxruntime / torch / python:   none
+conversion exit: 0
+```
+
+Two details would have made a weaker check misleading:
+
+* **`vulkan-1.dll` does not appear in the import table at all.** ncnn resolves the
+  loader dynamically rather than linking against it, so reading the imports alone
+  would have suggested this program does not use Vulkan. Both halves were needed.
+* **`nvcuda.dll` and `onnxruntime.dll` are installed on this machine.** Their
+  absence from the loaded set is therefore not because they are unavailable — it is
+  because nothing asks for them. On a machine without them the result would have
+  proved much less.
+
+Reproduce by starting `target\release\sr-cli.exe` on a conversion and reading
+`$process.Modules` while it runs.
+
 ## Restoration QC, and a result that needs a product decision
 
 Both fixtures below are built the same way: a known 1620x1080 original, downscaled
