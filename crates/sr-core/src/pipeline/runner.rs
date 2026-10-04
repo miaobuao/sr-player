@@ -1013,14 +1013,18 @@ impl PipelineRunner {
                 .unwrap_or_else(|| "no video stream".into()),
         });
 
-        let drift = (out_manifest.duration_seconds() - plan.video.source.duration_seconds).abs();
+        // Both sides measured as content: the source's plan duration already
+        // excludes a leading offset, so the output must be measured the same way
+        // or a correct transcode of a late-starting file looks short.
+        let drift =
+            (out_manifest.content_duration_seconds() - plan.video.source.duration_seconds).abs();
         checks.push(QcCheck {
             name: "duration drift".into(),
             passed: drift <= duration_tolerance.max(0.5),
             detail: format!(
                 "source {:.3}s, output {:.3}s, drift {:.3}s (tolerance {:.3}s)",
                 plan.video.source.duration_seconds,
-                out_manifest.duration_seconds(),
+                out_manifest.content_duration_seconds(),
                 drift,
                 duration_tolerance.max(0.5)
             ),

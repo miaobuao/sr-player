@@ -366,8 +366,8 @@ fn a_dissolve_is_fragmented_but_the_job_still_runs() {
 /// be the content duration — the format duration less the start time, or the sum
 /// of the stream durations — rather than the raw container figure.
 #[test]
-#[ignore = "the transcode is correct but QC compares against the container's duration including \
-            its timestamp offset, so a late-starting source is reported as a failure"]
+
+
 fn a_non_zero_start_time_is_normalised() {
     let Some(ff) = ffmpeg_or_skip() else {
         return;

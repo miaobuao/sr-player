@@ -789,7 +789,9 @@ pub fn build_plan(
     })?;
     let (raw_w, raw_h) = video_stream.size().unwrap_or((0, 0));
     let (square_w, square_h) = video_stream.square_pixel_size().unwrap_or((raw_w, raw_h));
-    let duration_seconds = manifest.duration_seconds();
+    // Content, not container: a leading timestamp offset is not runtime, and every
+    // estimate below - frames, progress, the QC comparison - is about content.
+    let duration_seconds = manifest.content_duration_seconds();
 
     // --- temporal -----------------------------------------------------------
     let cadence = cadence_for(manifest, temporal)?;

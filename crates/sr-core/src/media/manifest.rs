@@ -113,6 +113,12 @@ impl StreamBase {
         self.index.unwrap_or(-1)
     }
 
+    /// The stream's first timestamp, in seconds. A stream can carry an offset the
+    /// container does not report.
+    pub fn start_seconds(&self) -> Option<f64> {
+        self.start_time.as_deref().and_then(|s| s.parse().ok())
+    }
+
     pub fn time_base(&self) -> Option<Rational> {
         self.time_base.as_deref().and_then(|s| Rational::parse(s).ok())
     }
@@ -392,6 +398,10 @@ pub struct FormatInfo {
     pub nb_streams: Option<u64>,
     #[serde(default, deserialize_with = "de::string_opt")]
     pub duration: Option<String>,
+    /// Where the container's timestamps begin. Not always zero, and when it is not,
+    /// the duration above counts the offset as content.
+    #[serde(default, deserialize_with = "de::string_opt")]
+    pub start_time: Option<String>,
     #[serde(default, deserialize_with = "de::u64_opt")]
     pub size: Option<u64>,
     #[serde(default, deserialize_with = "de::string_opt")]
@@ -404,6 +414,11 @@ pub struct FormatInfo {
 }
 
 impl FormatInfo {
+    /// The container's first timestamp, in seconds.
+    pub fn start_seconds(&self) -> Option<f64> {
+        self.start_time.as_deref().and_then(|s| s.parse().ok())
+    }
+
     pub fn duration_seconds(&self) -> Option<f64> {
         self.duration.as_deref().and_then(|s| s.parse().ok())
     }
@@ -467,6 +482,34 @@ impl MediaManifest {
 
     pub fn duration_seconds(&self) -> f64 {
         self.duration().map(|t| t.seconds_f64()).unwrap_or(0.0)
+    }
+
+    /// How long the content actually runs.
+    ///
+    /// The container's duration counts a leading timestamp offset as content. A
+    /// file whose first frame is at ten seconds reports eleven seconds of duration
+    /// for one second of pictures, and every comparison against that number is
+    /// wrong: a correct transcode looks ten seconds short, progress bars run to
+    /// the wrong place, and an unattended run reports a good file as a failure.
+    ///
+    /// Measured from the format's start time when it has one, and from the primary
+    /// video stream's otherwise, because a stream can carry the offset when the
+    /// container does not.
+    pub fn content_duration_seconds(&self) -> f64 {
+        let raw = self.duration_seconds();
+        let start = self
+            .format
+            .start_seconds()
+            .or_else(|| {
+                self.primary_video()
+                    .and_then(|video| video.base.start_seconds())
+            })
+            .unwrap_or(0.0);
+        if start <= 0.0 {
+            raw
+        } else {
+            (raw - start).max(0.0)
+        }
     }
 
     pub fn has_hdr_video(&self) -> bool {
@@ -671,6 +714,34 @@ pub fn looks_like_media(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A container duration counts a leading timestamp offset as content, and
+    /// comparing against it declares a correct transcode short. The corpus found
+    /// this on a real file; this is the rule in isolation.
+    #[test]
+    fn the_content_duration_excludes_a_leading_offset() {
+        let mut manifest = MediaManifest::default();
+        manifest.format.duration = Some("11.000000".into());
+        manifest.format.start_time = Some("10.000000".into());
+        // Eleven seconds of container for one second of pictures.
+        assert_eq!(manifest.duration_seconds(), 11.0);
+        assert_eq!(manifest.content_duration_seconds(), 1.0);
+
+        // A stream can carry the offset when the container does not.
+        manifest.format.start_time = None;
+        let mut video = VideoStream::default();
+        video.base.start_time = Some("10.000000".into());
+        manifest.video.push(video);
+        assert_eq!(manifest.content_duration_seconds(), 1.0);
+
+        // And a normal file is unchanged: no offset, no subtraction, and a
+        // negative offset is not allowed to invent runtime.
+        manifest.format.start_time = Some("0.000000".into());
+        manifest.video.clear();
+        assert_eq!(manifest.content_duration_seconds(), 11.0);
+        manifest.format.start_time = Some("-2.000000".into());
+        assert_eq!(manifest.content_duration_seconds(), 11.0);
+    }
 
     const SAMPLE: &str = r#"{
       "streams": [
